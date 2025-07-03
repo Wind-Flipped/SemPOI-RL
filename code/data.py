@@ -9,13 +9,13 @@ import collections
 from os.path import join
 import torch
 import json
-import dgl
+# import dgl
 import os
 import pickle
 from collections import Counter
 try:
     import ipdb
-except:
+except ImportError:
     pass
 import matplotlib.pyplot as plt
 import pytz
@@ -356,3 +356,191 @@ def random_split(dataset, dataset_name, split_path, ratios=[0.8, 0.1, 0.1]):
         pickle.dump([train_indice, valid_indice, test_indice], file)
 
     return Subset(dataset, train_indice), Subset(dataset, valid_indice), Subset(dataset, test_indice) # train_indices 是训练数据的索引列表
+
+class TravelTextDataset(Dataset):
+    """
+    用于生成旅游轨迹文本描述的数据集类
+    生成用于GRPO训练的prompt和reference对
+    """
+    def __init__(self, args, home_data_path, oot_data_path, travel_data_path):
+        """
+        初始化文本数据集
+        
+        Args:
+            args: 配置参数
+            home_data_path: 原始地数据路径
+            oot_data_path: 目的地数据路径 
+            travel_data_path: 旅行数据路径
+        """
+        self.args = args
+        
+        # 读取数据文件
+        home_raw = list(map(lambda x: x.strip().split('\t'), open(home_data_path, 'r')))
+        oot_raw = list(map(lambda x: x.strip().split('\t'), open(oot_data_path, 'r')))
+        travel_raw = list(map(lambda x: x.strip().split('\t'), open(travel_data_path, 'r')))
+        
+        # 加载pickle文件
+        with open(f"../{self.args.dataset_name}/poi_coord.pkl", "rb") as f:
+            self.poi_coord = pickle.load(f)
+        
+        with open(f"../{self.args.dataset_name}/city_tz_mapping.pkl", "rb") as f:
+            self.city_tz_mapping = pickle.load(f)
+        
+        # 按用户ID组织数据
+        self.home_data = self._organize_data_by_user(home_raw)
+        self.oot_data = self._organize_data_by_user(oot_raw)
+        self.travel_data = {int(row[0]): (row[2], row[3]) for row in travel_raw}
+        
+        # 生成文本对
+        self.text_pairs = self._generate_text_pairs()
+    
+    def _organize_data_by_user(self, raw_data):
+        """按用户ID组织数据"""
+        user_data = defaultdict(list)
+        for row in raw_data:
+            uid, cuid, rid, bid, timestamp, std_tag = row
+            user_data[int(uid)].append({
+                'cuid': cuid,
+                'region': rid,
+                'poi_id': bid,
+                'timestamp': float(timestamp),
+                'category': std_tag
+            })
+        return user_data
+    
+    def _format_trajectory_text(self, trajectory_data, region_name, query_type="hometown"):
+        """
+        格式化轨迹数据为文本描述
+        
+        Args:
+            trajectory_data: 轨迹数据列表
+            region_name: 区域名称
+            query_type: 查询类型 ("hometown" 或 "destination")
+        
+        Returns:
+            格式化的文本描述
+        """
+        if not trajectory_data:
+            return ""
+        
+        # 按时间排序
+        trajectory_data = sorted(trajectory_data, key=lambda x: x['timestamp'])
+        
+        poi_descriptions = []
+        for i, point in enumerate(trajectory_data):
+            poi_id = point['poi_id']
+            category = point['category']
+            timestamp = point['timestamp']
+            
+            # 获取POI坐标
+            coord = self.poi_coord.get(poi_id, (0.0, 0.0))
+            lat, lon = coord
+            
+            # 转换时间戳为UTC时间
+            dt_utc = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+            utc_time_str = dt_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+            
+            poi_desc = f"POI {i+1}: Category={category}, Location=({lat:.4f}, {lon:.4f}), Time={utc_time_str}"
+            poi_descriptions.append(poi_desc)
+        
+        trajectory_text = "\n".join(poi_descriptions)
+        
+        if query_type == "hometown":
+            prompt = f"""User's travel trajectory in {region_name} (hometown):
+{trajectory_text}
+
+Based on this hometown travel pattern, what would be the user's likely travel style when visiting a destination city? Please describe their preferences for:
+1. Types of attractions they would visit
+2. Activity patterns and pace
+3. Overall travel behavior
+
+Travel style prediction:"""
+        
+        else:  # destination
+            prompt = f"""User's actual travel trajectory in {region_name} (destination):
+{trajectory_text}
+
+Based on this actual travel behavior in the destination city, describe the user's travel style including:
+1. Types of attractions they prefer
+2. Activity patterns and pace  
+3. Overall travel behavior
+
+Travel style description:"""
+        
+        return prompt
+    
+    def _generate_text_pairs(self):
+        """生成prompt和reference文本对"""
+        text_pairs = []
+        
+        for uid in self.travel_data:
+            if uid not in self.home_data or uid not in self.oot_data:
+                continue
+            
+            ori_region, dst_region = self.travel_data[uid]
+            home_trajectory = self.home_data[uid]
+            oot_trajectory = self.oot_data[uid]
+            
+            # 生成hometown prompt (用于训练时的输入)
+            hometown_prompt = self._format_trajectory_text(
+                home_trajectory, ori_region, "hometown"
+            )
+            
+            # 生成destination reference (用于训练时的参考答案)
+            destination_prompt = self._format_trajectory_text(
+                oot_trajectory, dst_region, "destination"
+            )
+            
+            if hometown_prompt and destination_prompt:
+                text_pairs.append({
+                    'uid': uid,
+                    'hometown_prompt': hometown_prompt,
+                    'destination_prompt': destination_prompt,
+                    'ori_region': ori_region,
+                    'dst_region': dst_region
+                })
+        
+        return text_pairs
+    
+    def get_prompt_reference_pairs(self):
+        """
+        获取用于GRPO训练的prompt和reference对
+        
+        Returns:
+            tuple: (prompts列表, references列表)
+        """
+        prompts = []
+        references = []
+        
+        for pair in self.text_pairs:
+            prompts.append(pair['hometown_prompt'])
+            # 这里我们需要一个LLM来处理destination_prompt并生成reference
+            # 暂时使用destination_prompt作为占位符
+            references.append(pair['destination_prompt'])
+        
+        return prompts, references
+    
+    def __len__(self):
+        """返回文本对的数量"""
+        return len(self.text_pairs)
+    
+    def __getitem__(self, index):
+        """获取指定索引的文本对"""
+        return self.text_pairs[index]
+
+def create_travel_text_dataset(args, dataset_name):
+    """
+    创建旅游文本数据集的便捷函数
+    
+    Args:
+        args: 配置参数
+        dataset_name: 数据集名称
+    
+    Returns:
+        TravelTextDataset实例
+    """
+    home_path = f"../{dataset_name}/home.txt"
+    oot_path = f"../{dataset_name}/oot.txt" 
+    travel_path = f"../{dataset_name}/travel.txt"
+    
+    return TravelTextDataset(args, home_path, oot_path, travel_path)

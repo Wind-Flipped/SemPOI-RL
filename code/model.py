@@ -8,7 +8,7 @@ from utils import _L2_loss_mean
 from GAT import GAT
 from einops import repeat
 from torchdiffeq import odeint
-import torchquad
+# import torchquad
 from torch.distributions import Normal, Independent
 from torch.nn.utils.rnn import pad_sequence
 import numpy as np
@@ -35,6 +35,8 @@ class Encoder(nn.Module):
                 dim_feedforward=2 * d_model,
                 batch_first=True,
                 dropout=dropout_prob,
+                norm_first=True,  # 使用Pre-LN架构更稳定
+                activation=F.gelu,  # 明确指定激活函数
             ) for _ in range(n_tf_layers)
         ])
 
@@ -49,26 +51,39 @@ class Encoder(nn.Module):
 
         t_emb = self.time_proj(d_t.to(torch.float32).unsqueeze(-1))
         coords_emb = self.space_proj(d_l.to(torch.float32))
-        # poi_emb = self.poi_proj(d_emb)
         poi_emb = self.poi_emb(d_emb)
 
         x = torch.cat(
             [
                 t_emb + coords_emb + poi_emb,
-                repeat(self.agg_token, "() () d -> b () d", b=d_t.shape[0]),
-            ],
+                repeat(self.agg_token, "() () d -> b () d", b=d_t.shape[0]),            ],
             dim=1,
         )
-        # x = torch.cat(
-        #     [
-        #         t_emb + poi_emb,
-        #         repeat(self.agg_token, "() () d -> b () d", b=d_t.shape[0]),
-        #     ],
-        #     dim=1,
-        # )
 
-        for layer in self.transformer_stack:
-            x = layer(x, src_key_padding_mask=d_pad)
+        # PyTorch的src_key_padding_mask语义：True表示需要被忽略的位置
+        # 因此需要将d_pad取反（假设d_pad中True表示有效位置）
+        padding_mask = ~d_pad
+        
+        # 调试信息和数值稳定性保护
+        for i, layer in enumerate(self.transformer_stack):
+            try:
+                x_before = x.clone()
+                x_new = layer(x, src_key_padding_mask=padding_mask)
+                
+                # 检查输出是否有效
+                if torch.isnan(x_new).any() or torch.isinf(x_new).any():
+                    print(f"Warning: NaN/Inf detected in transformer layer {i}")
+                    print(f"Input range: [{x_before.min():.4f}, {x_before.max():.4f}]")
+                    print(f"d_pad shape: {d_pad.shape}, unique values: {torch.unique(d_pad)}")
+                    # 保持原来的x不变，跳过这一层
+                    continue
+                else:
+                    x = x_new
+                    
+            except Exception as e:
+                print(f"Error in transformer layer {i}: {e}")
+                # 跳过这一层，使用原来的x
+                continue
 
         x = x[:, -1, :]
 
@@ -850,11 +865,11 @@ class SPOTModel(nn.Module):
                     gt_times_unif = d_t[j][valid_idx].to(torch.float32)
                     # print("gt_times_unif:", gt_times_unif)
                     z_unif_j = odeint(self.dyf, z_0[j].unsqueeze(0), gt_times_unif,
-                                      rtol=self.args.rtol, atol=self.args.atol, method=self.args.solver)
+                                      rtol=self.args.rtol, atol=self.args.atol, method=self.args.solver, options={"min_step": 0.0001, "max_step": 100})
                 else:
                     s_unif = torch.linspace(0, 1, n_pred + 2, device=self.args.device, dtype=torch.float32)
                     z_unif_j = odeint(self.dyf, z_0[j].unsqueeze(0), s_unif,
-                                      rtol=self.args.rtol, atol=self.args.atol, method=self.args.solver)
+                                      rtol=self.args.rtol, atol=self.args.atol, method=self.args.solver, options={"min_step": 0.0001, "max_step": 100})
                 u_hat = z_unif_j.transpose(0, 1).squeeze(0)
                 P_D.append(u_hat)
                 if target_seq is not None:

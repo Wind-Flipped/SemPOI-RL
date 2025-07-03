@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1, 2"  # Set the visible GPU device
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence

@@ -5,7 +5,7 @@ import scipy.sparse as sp
 import torch
 from torch.nn.utils.rnn import pad_sequence
 import time
-import dgl
+# import dgl
 
 try:
     import ipdb
@@ -32,7 +32,7 @@ def set_seeds(seed):
     torch.backends.cudnn.benchmark = False
     
     os.environ['PYTHONHASHSEED'] = str(seed)
-    dgl.seed(seed)
+    # dgl.seed(seed)
 
 class Device(object):
     """
