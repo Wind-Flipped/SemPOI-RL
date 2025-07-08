@@ -14,13 +14,16 @@ from torch.nn.utils.rnn import pad_sequence
 import numpy as np
 from trainer import top_np_recommendation
 
+from LLMs import TravelStyleGenerator, TravelStyleRewardCalculator
+
+
 class Encoder(nn.Module):
     """Encoder mapping context sequences to parameters of the posterior q(z1)."""
 
     def __init__(
-        self, poi_size,
-        d_z: int,
-        d_model: int, n_attn_heads: int, n_tf_layers: int, dropout_prob: float = 0.0,
+            self, poi_size,
+            d_z: int,
+            d_model: int, n_attn_heads: int, n_tf_layers: int, dropout_prob: float = 0.0,
     ) -> None:
         super().__init__()
 
@@ -56,20 +59,20 @@ class Encoder(nn.Module):
         x = torch.cat(
             [
                 t_emb + coords_emb + poi_emb,
-                repeat(self.agg_token, "() () d -> b () d", b=d_t.shape[0]),            ],
+                repeat(self.agg_token, "() () d -> b () d", b=d_t.shape[0]), ],
             dim=1,
         )
 
         # PyTorch的src_key_padding_mask语义：True表示需要被忽略的位置
         # 因此需要将d_pad取反（假设d_pad中True表示有效位置）
         padding_mask = ~d_pad
-        
+
         # 调试信息和数值稳定性保护
         for i, layer in enumerate(self.transformer_stack):
             try:
                 x_before = x.clone()
                 x_new = layer(x, src_key_padding_mask=padding_mask)
-                
+
                 # 检查输出是否有效
                 if torch.isnan(x_new).any() or torch.isinf(x_new).any():
                     print(f"Warning: NaN/Inf detected in transformer layer {i}")
@@ -79,7 +82,7 @@ class Encoder(nn.Module):
                     continue
                 else:
                     x = x_new
-                    
+
             except Exception as e:
                 print(f"Error in transformer layer {i}: {e}")
                 # 跳过这一层，使用原来的x
@@ -88,6 +91,7 @@ class Encoder(nn.Module):
         x = x[:, -1, :]
 
         return x, self.gamma_proj(x), torch.nn.functional.softplus(self.tau_proj(x))  # 更稳定
+
 
 def _nearest_interpolate(t_eval, t, z, ind_left, ind_right):
     dist_left = torch.abs(t_eval - t[ind_left])
@@ -102,6 +106,7 @@ def _linear_interpolate(t_eval, t, z, ind_left, ind_right):
     weight_right = (t_eval - t_left) / (t_right - t_left + 1e-3)
     weight_left = 1 - weight_right
     return weight_left.unsqueeze(1) * z[ind_left] + weight_right.unsqueeze(1) * z[ind_right]
+
 
 def interpolate(t_eval, t, z, method: str = "nearest"):
     """
@@ -119,7 +124,7 @@ def interpolate(t_eval, t, z, method: str = "nearest"):
     if method not in {"nearest", "linear"}:
         raise ValueError(f"Interpolation method {method} is not supported.")
 
-    ind_right = torch.searchsorted(t, t_eval) # 查找 t_eval 在时间序列 t 中的插入位置，返回的 ind_right 是右侧的索引
+    ind_right = torch.searchsorted(t, t_eval)  # 查找 t_eval 在时间序列 t 中的插入位置，返回的 ind_right 是右侧的索引
     ind_left = ind_right - 1
     ind_left.clamp_(min=0)
     ind_right.clamp_(max=len(t) - 1)
@@ -128,6 +133,7 @@ def interpolate(t_eval, t, z, method: str = "nearest"):
         return _nearest_interpolate(t_eval, t, z, ind_left, ind_right)
     else:  # method == "linear"
         return _linear_interpolate(t_eval, t, z, ind_left, ind_right)
+
 
 def kl_norm_norm(mu0, mu1, sig0, sig1):
     """Calculates KL divergence between two K-dimensional Normal
@@ -142,12 +148,14 @@ def kl_norm_norm(mu0, mu1, sig0, sig1):
     Returns:
         KL divergence between the distributions. Has shape (*, 1).
     """
-    assert mu0.shape == mu1.shape == sig0.shape == sig1.shape, (f"{mu0.shape=} {mu1.shape=} {sig0.shape=} {sig1.shape=}")
+    assert mu0.shape == mu1.shape == sig0.shape == sig1.shape, (
+        f"{mu0.shape=} {mu1.shape=} {sig0.shape=} {sig1.shape=}")
     a = (sig0 / sig1).pow(2).sum(-1, keepdim=True)
-    b = ((mu1 - mu0).pow(2) / sig1**2).sum(-1, keepdim=True)
+    b = ((mu1 - mu0).pow(2) / sig1 ** 2).sum(-1, keepdim=True)
     c = 2 * (torch.log(sig1) - torch.log(sig0)).sum(-1, keepdim=True)
     kl = 0.5 * (a + b + c - mu0.shape[-1])
     return kl
+
 
 def create_mlp(
         input_size,
@@ -189,6 +197,7 @@ def create_mlp(
 
     layers.append(nn.Linear(hidden_size, output_size))
     return nn.Sequential(*layers)
+
 
 class DynamicsFunction(nn.Module):
     def __init__(self, f):
@@ -245,6 +254,7 @@ class DynamicTimeGenerator(nn.Module):
 
         return full_times_padded
 
+
 class ContinuousDecoder(nn.Module):
     """Maps latent state z(t) and spatial coordinate x to u(t, x).
 
@@ -254,10 +264,11 @@ class ContinuousDecoder(nn.Module):
         d_u (int): Dimensionality of the latent spatiotemporal state.
         f (Module): Mapping from (z(t), x) to u(t, x).
     """
+
     def __init__(self, d_z, d_x, f, interp_method):
         super().__init__()
         # self.space_proj = nn.Linear(d_x, d_z, bias=False)
-        self.f = f # mlp
+        self.f = f  # mlp
         self.interp_method = interp_method
 
     def forward(self, t_eval, t, z):
@@ -281,6 +292,8 @@ class ContinuousDecoder(nn.Module):
         z_eval = interpolate(t_eval, t, z, method=self.interp_method)
         # return self.f(z_eval + self.space_proj(x_eval))
         return self.f(z_eval)
+
+
 class IntensityCorrection(nn.Module):
     def __init__(self, val=0):
         super().__init__()
@@ -290,6 +303,7 @@ class IntensityCorrection(nn.Module):
         # return torch.pow(x, 2) + self.val
         return torch.exp(x) + self.val
 
+
 class POIEmbeddings(nn.Module):
     def __init__(self, poi_size, poi_embed_dim):
         super(POIEmbeddings, self).__init__()
@@ -298,6 +312,7 @@ class POIEmbeddings(nn.Module):
     def forward(self, traj):
         x = self.emb(traj)
         return x
+
 
 # =================Transformer framework================== #
 class TransformerModel(nn.Module):
@@ -381,12 +396,17 @@ class Guiding(nn.Module):
 
         return clipped_outputs
 
+
 # Construct total framework(AR-Trip)
 class SPOTModel(nn.Module):
     def __init__(self, args, poi_size, region_poi,
-                 max_length_venue_id=100, d_model=128, n_head=4, num_encoder_layers=1, n_tf_layers=4, d_z=128, kg_dataset=None):
+                 max_length_venue_id=100, d_model=128, n_head=4, num_encoder_layers=1, n_tf_layers=4, d_z=128,
+                 kg_dataset=None):
 
         super(SPOTModel, self).__init__()
+        # initial LLMs
+        self.travel_style_generator = TravelStyleGenerator()
+        self.travel_style_reward_calculator = TravelStyleRewardCalculator()
         # initial hyperparameter
         self.hidden_size = d_model
         self.args = args
@@ -412,10 +432,10 @@ class SPOTModel(nn.Module):
         self.encoder = Encoder(poi_size, d_z, d_model, n_head, n_tf_layers)
         self.dyf = DynamicsFunction(
             f=create_mlp(input_size=args.hidden_size,
-            output_size=args.hidden_size,
-            hidden_size=args.dyn_latent_dim,
-            num_hidden_layers=args.dyn_hid_layers,
-            activation_func=nn.GELU))
+                         output_size=args.hidden_size,
+                         hidden_size=args.dyn_latent_dim,
+                         num_hidden_layers=args.dyn_hid_layers,
+                         activation_func=nn.GELU))
         self.time_generator = DynamicTimeGenerator(self.hidden_size, self.hidden_size)
         self.lm = nn.Sequential(
             create_mlp(
@@ -434,7 +454,9 @@ class SPOTModel(nn.Module):
             nn.Linear(self.hidden_size, self.hidden_size),
             nn.SiLU()
         )
-        if self.args.ode and self.args.s_infer:
+        if self.args.ode and self.args.use_llm:
+            self.predictor = Recommender(self.hidden_size * 4, poi_size)
+        elif self.args.ode and self.args.s_infer:
             self.predictor = Recommender(self.hidden_size * 4, poi_size)
         elif self.args.ode or self.args.s_infer:
             self.predictor = Recommender(self.hidden_size * 3, poi_size)
@@ -464,17 +486,19 @@ class SPOTModel(nn.Module):
         """
         # Each sample corresponds to an index of a relation type, and embedding_relation converts the index of each relation type into the corresponding embedding vector.
         r_embed = self.relations_embedding(r)
-        h_embed = self.poi_embedding(h) # (kg_batch_size, entity_dim)
-        pos_t_embed = self.entity_embedding(pos_t) # (kg_batch_size, entity_dim)
-        neg_t_embed = self.entity_embedding(neg_t) # (kg_batch_size, entity_dim)
-        pos_score = torch.sum(torch.pow(h_embed + r_embed - pos_t_embed, 2), dim=1) # (kg_batch_size) As per the formula f_d in the paper.
-        neg_score = torch.sum(torch.pow(h_embed + r_embed - neg_t_embed, 2), dim=1) # (kg_batch_size)
+        h_embed = self.poi_embedding(h)  # (kg_batch_size, entity_dim)
+        pos_t_embed = self.entity_embedding(pos_t)  # (kg_batch_size, entity_dim)
+        neg_t_embed = self.entity_embedding(neg_t)  # (kg_batch_size, entity_dim)
+        pos_score = torch.sum(torch.pow(h_embed + r_embed - pos_t_embed, 2),
+                              dim=1)  # (kg_batch_size) As per the formula f_d in the paper.
+        neg_score = torch.sum(torch.pow(h_embed + r_embed - neg_t_embed, 2), dim=1)  # (kg_batch_size)
         kg_loss = (-1.0) * F.logsigmoid(neg_score - pos_score)
         kg_loss = torch.mean(kg_loss)
 
         # This value can be considered as the "energy" of the input samples.
         # This code is typically used for calculating regularization terms in the loss function.
-        l2_loss = _L2_loss_mean(h_embed) + _L2_loss_mean(r_embed) + _L2_loss_mean(pos_t_embed) + _L2_loss_mean(neg_t_embed)
+        l2_loss = _L2_loss_mean(h_embed) + _L2_loss_mean(r_embed) + _L2_loss_mean(pos_t_embed) + _L2_loss_mean(
+            neg_t_embed)
         # # TODO: optimize L2 weight
         loss = kg_loss + 1e-3 * l2_loss
         return loss
@@ -499,7 +523,8 @@ class SPOTModel(nn.Module):
         kg_loss = (-1.0) * F.logsigmoid(neg_score - pos_score)
         kg_loss = torch.mean(kg_loss)
 
-        l2_loss = _L2_loss_mean(h_embed) + _L2_loss_mean(r_embed) + _L2_loss_mean(pos_t_embed) + _L2_loss_mean(neg_t_embed)
+        l2_loss = _L2_loss_mean(h_embed) + _L2_loss_mean(r_embed) + _L2_loss_mean(pos_t_embed) + _L2_loss_mean(
+            neg_t_embed)
         # # TODO: optimize L2 weight
         loss = kg_loss + 1e-3 * l2_loss
         return loss
@@ -516,20 +541,20 @@ class SPOTModel(nn.Module):
             loss
         """
         # Each sample corresponds to an index of a relation type, and the embedding_relation converts the index of each relation type into the corresponding embedding vector.
-        r_embed = self.relations_embedding(r)        # (kg_batch_size, relation_dim)
-        h_embed = self.poi_embedding(h)               # (kg_batch_size, entity_dim)
-        pos_t_embed = self.entity_embedding(pos_t)      # (kg_batch_size, entity_dim)
-        neg_t_embed = self.entity_embedding(neg_t)      # (kg_batch_size, entity_dim)
+        r_embed = self.relations_embedding(r)  # (kg_batch_size, relation_dim)
+        h_embed = self.poi_embedding(h)  # (kg_batch_size, entity_dim)
+        pos_t_embed = self.entity_embedding(pos_t)  # (kg_batch_size, entity_dim)
+        neg_t_embed = self.entity_embedding(neg_t)  # (kg_batch_size, entity_dim)
 
         k_num = self.args.segments
         rank = int(self.hidden_size / k_num)
-        h = [h_embed[i * rank : (i + 1) * rank] for i in range(k_num)]
+        h = [h_embed[i * rank: (i + 1) * rank] for i in range(k_num)]
         h = tuple(h)
-        r = [r_embed[i * rank : (i + 1) * rank] for i in range(k_num)]
+        r = [r_embed[i * rank: (i + 1) * rank] for i in range(k_num)]
         r = tuple(r)
-        pos_t = [pos_t_embed[i * rank : (i + 1) * rank] for i in range(k_num)]
+        pos_t = [pos_t_embed[i * rank: (i + 1) * rank] for i in range(k_num)]
         pos_t = tuple(pos_t)
-        neg_t = [neg_t_embed[i * rank : (i + 1) * rank] for i in range(k_num)]
+        neg_t = [neg_t_embed[i * rank: (i + 1) * rank] for i in range(k_num)]
         neg_t = tuple(neg_t)
         pos_tmp = 0
         neg_tmp = 0
@@ -547,7 +572,8 @@ class SPOTModel(nn.Module):
 
         # This value can be considered as the "energy" of the input samples.
         # This code is typically used for calculating regularization terms in the loss function.
-        l2_loss = _L2_loss_mean(h_embed) + _L2_loss_mean(r_embed) + _L2_loss_mean(pos_t_embed) + _L2_loss_mean(neg_t_embed)
+        l2_loss = _L2_loss_mean(h_embed) + _L2_loss_mean(r_embed) + _L2_loss_mean(pos_t_embed) + _L2_loss_mean(
+            neg_t_embed)
         # # TODO: optimize L2 weight
         loss = kg_loss + 1e-3 * l2_loss
         # loss = kg_loss
@@ -586,7 +612,7 @@ class SPOTModel(nn.Module):
             Tensor
         """
         if mode == 'transr':
-            relation = rel_embs[r].view(-1, self.hidden_size, self.hidden_size) # b x (h x h)
+            relation = rel_embs[r].view(-1, self.hidden_size, self.hidden_size)  # b x (h x h)
             if len(emb.shape) == 2:
                 emb_r = torch.bmm(emb.unsqueeze(1), relation).squeeze(1)
                 return emb_r
@@ -594,17 +620,18 @@ class SPOTModel(nn.Module):
                 emb_r = torch.matmul(emb.unsqueeze(2), relation.unsqueeze(1).expand(-1, emb.size(1), -1, -1)).squeeze(2)
                 return emb_r
         if mode == 'transd':
-            relation = rel_embs[r] # b x h Embeddings of 64 regions (cities) visited by users
+            relation = rel_embs[r]  # b x h Embeddings of 64 regions (cities) visited by users
             if len(emb.shape) == 2:
                 # b x h x h matrix multiplication
                 # equivalent to the embedding weights of the region (city) multiplied by the node embedding that has passed through a linear layer.
-                trans_mat = torch.matmul(relation.unsqueeze(2), self.head_linear(emb).unsqueeze(1)) # b x h x h
+                trans_mat = torch.matmul(relation.unsqueeze(2), self.head_linear(emb).unsqueeze(1))  # b x h x h
                 # torch.bmm() might be faster, but both are matrix-level multiplication
                 emb_r = torch.bmm(emb.unsqueeze(1), trans_mat).squeeze(1)
                 return emb_r
             elif len(emb.shape) == 3:
                 # b x h x h (64, 13, 128, 1) * (64, 13, 1, 128)
-                trans_mat = torch.matmul(relation.view(relation.size(0), 1, -1, 1).expand(-1, emb.size(1), -1, -1), self.tail_linear(emb).unsqueeze(2)) # b x h x h
+                trans_mat = torch.matmul(relation.view(relation.size(0), 1, -1, 1).expand(-1, emb.size(1), -1, -1),
+                                         self.tail_linear(emb).unsqueeze(2))  # b x h x h
                 emb_r = torch.matmul(emb.unsqueeze(2), trans_mat).squeeze(2)
                 return emb_r
         if mode == 'transe':
@@ -644,11 +671,12 @@ class SPOTModel(nn.Module):
         Returns:
             Tensor
         """
-        poi_embs = self.poi_embedding(torch.IntTensor(list(kg.keys())).to(self.args.device)) #poi_num, emb_dim
-        poi_entities = torch.stack(list(kg.values())) # poi_num, entity_num_each
-        entity_embs = self.entity_embedding(poi_entities) # poi_num, entity_num_each, emb_dim
+        poi_embs = self.poi_embedding(torch.IntTensor(list(kg.keys())).to(self.args.device))  # poi_num, emb_dim
+        poi_entities = torch.stack(list(kg.values()))  # poi_num, entity_num_each
+        entity_embs = self.entity_embedding(poi_entities)  # poi_num, entity_num_each, emb_dim
         # item_num, entity_num_each
-        padding_mask = torch.where(poi_entities!=self.n_entities, torch.ones_like(poi_entities), torch.zeros_like(poi_entities)).float()
+        padding_mask = torch.where(poi_entities != self.n_entities, torch.ones_like(poi_entities),
+                                   torch.zeros_like(poi_entities)).float()
         # padding is zero
         entity_embs = entity_embs * padding_mask.unsqueeze(-1).expand(entity_embs.size())
         # poi_num, emb_dim
@@ -657,33 +685,35 @@ class SPOTModel(nn.Module):
         # replace nan with zeros
         entity_embs_mean = torch.nan_to_num(entity_embs_mean)
         # poi_num, emb_dim
-        return poi_embs+entity_embs_mean
+        return poi_embs + entity_embs_mean
 
-    def cal_poi_embedding_gat(self, kg:dict):
+    def cal_poi_embedding_gat(self, kg: dict):
         """
         Calculates the POI embeddings using a Graph Attention Network (GAT) based on the associated entities.
         Returns:
             Tensor
         """
-        poi_embs = self.poi_embedding(torch.IntTensor(list(kg.keys())).to(self.args.device)) #poi_num, emb_dim
-        poi_entities = torch.stack(list(kg.values())) # poi_num, entity_num_each
-        entity_embs = self.entity_embedding(poi_entities) # poi_num, entity_num_each, emb_dim
+        poi_embs = self.poi_embedding(torch.IntTensor(list(kg.keys())).to(self.args.device))  # poi_num, emb_dim
+        poi_entities = torch.stack(list(kg.values()))  # poi_num, entity_num_each
+        entity_embs = self.entity_embedding(poi_entities)  # poi_num, entity_num_each, emb_dim
         # poi_num, entity_num_each
-        padding_mask = torch.where(poi_entities!=self.n_entities, torch.ones_like(poi_entities), torch.zeros_like(poi_entities)).float()
+        padding_mask = torch.where(poi_entities != self.n_entities, torch.ones_like(poi_entities),
+                                   torch.zeros_like(poi_entities)).float()
         return self.gat(poi_embs, entity_embs, padding_mask)
 
-    def cal_poi_embedding_rgat(self, kg:dict):
+    def cal_poi_embedding_rgat(self, kg: dict):
         """
         Calculates POI embeddings using a Relational Graph Attention Network (RGAT).
         Returns:
             Tensor
         """
-        poi_embs = self.poi_embedding(torch.IntTensor(list(kg.keys())).to(self.args.device)) #poi_num, emb_dim
-        poi_entities = torch.stack(list(kg.values())) # poi_num, entity_num_each
+        poi_embs = self.poi_embedding(torch.IntTensor(list(kg.keys())).to(self.args.device))  # poi_num, emb_dim
+        poi_entities = torch.stack(list(kg.values()))  # poi_num, entity_num_each
         poi_relations = torch.stack(list(self.poi2relations.values()))
-        entity_embs = self.entity_embedding(poi_entities) # poi_num, entity_num_each, emb_dim
-        relation_embs = self.relations_embedding(poi_relations) # poi_num, entity_num_each, emb_dim
-        padding_mask = torch.where(poi_entities!=self.n_entities, torch.ones_like(poi_entities), torch.zeros_like(poi_entities)).float()
+        entity_embs = self.entity_embedding(poi_entities)  # poi_num, entity_num_each, emb_dim
+        relation_embs = self.relations_embedding(poi_relations)  # poi_num, entity_num_each, emb_dim
+        padding_mask = torch.where(poi_entities != self.n_entities, torch.ones_like(poi_entities),
+                                   torch.zeros_like(poi_entities)).float()
         return self.gat.forward_relation(poi_embs, entity_embs, relation_embs, padding_mask)
 
     def cal_poi_embedding_from_kg(self, kg: dict):
@@ -695,13 +725,13 @@ class SPOTModel(nn.Module):
         if kg is None:
             kg = self.kg_dict
 
-        if(self.args.kgcn=="GAT"):
+        if (self.args.kgcn == "GAT"):
             return self.cal_poi_embedding_gat(kg)
-        elif self.args.kgcn=="RGAT":
+        elif self.args.kgcn == "RGAT":
             return self.cal_poi_embedding_rgat(kg)
-        elif(self.args.kgcn=="MEAN"):
+        elif (self.args.kgcn == "MEAN"):
             return self.cal_poi_embedding_mean(kg)
-        elif(self.args.kgcn=="NO"):
+        elif (self.args.kgcn == "NO"):
             return self.poi_embedding.weight
 
     def get_ui_views_weighted(self, poi_stabilities, stab_weight):
@@ -715,10 +745,10 @@ class SPOTModel(nn.Module):
         kg_weights = (poi_stabilities - poi_stabilities.min()) / (poi_stabilities.max() - poi_stabilities.min())
         # Replace elements in kg_weights less than or equal to 0.3 with 0.3, keep elements greater than 0.3 unchanged.
         kg_weights = kg_weights.where(kg_weights > 0.3, torch.ones_like(kg_weights) * 0.3)
-        weights = (1-self.args.ui_p_drop)/torch.mean(stab_weight*kg_weights)*(stab_weight*kg_weights)
+        weights = (1 - self.args.ui_p_drop) / torch.mean(stab_weight * kg_weights) * (stab_weight * kg_weights)
         # weights = weights.where(weights>0.3, torch.ones_like(weights) * 0.3)
         # Replace elements in weights greater than or equal to 0.95 with 0.95, keep elements less than 0.95 unchanged.
-        weights = weights.where(weights<0.95, torch.ones_like(weights) * 0.95)
+        weights = weights.where(weights < 0.95, torch.ones_like(weights) * 0.95)
         # Perform Bernoulli sampling to get a mask tensor poi_mask of the same dimension as weights,
         # where the probability of an element being True is the corresponding value in weights.
         # Values are chosen as 1 or 0 with probabilities p and 1-p, respectively.
@@ -734,7 +764,7 @@ class SPOTModel(nn.Module):
             Tensor
         """
         if z1.size()[0] == z2.size()[0]:
-            return F.cosine_similarity(z1,z2)
+            return F.cosine_similarity(z1, z2)
         else:
             z1 = F.normalize(z1)
             z2 = F.normalize(z2)
@@ -750,7 +780,6 @@ class SPOTModel(nn.Module):
         kgv2_ro = self.cal_poi_embedding_from_kg(view2)
         sim = self.sim(kgv1_ro, kgv2_ro)
         return kgv1_ro, kgv2_ro, sim
-
 
     def get_views(self, aug_side="both"):
         """
@@ -832,7 +861,7 @@ class SPOTModel(nn.Module):
             padded_list.append(padded_seq)
         return torch.stack(padded_list, dim=0)
 
-    def forward(self, o_ck, query, o_t, d_t, o_l, d_l, o_pad, d_pad, d_ck, o_rg, d_rg, target_seq=None):
+    def forward(self, messages, o_ck, query, o_t, d_t, o_l, d_l, o_pad, d_pad, d_ck, o_rg, d_rg, target_seq=None):
         batch_size, seq_length = query.size()
         # region_repr = self.region_embedding.weight
         region_mask = torch.stack([self.region_masks[int(r)] for r in d_rg], dim=0)
@@ -850,10 +879,22 @@ class SPOTModel(nn.Module):
             d_target_emb = self.poi_embedding(d_ck)
             pad_vec = self.poi_embedding.emb.weight[0]
 
+        if self.args.use_llm:
+            self.args.kg = False
+            self.args.s_infer = False
+            # 1. 通过LLM生成文本
+            generated_texts = self.travel_style_generator.get_output(messages, max_length=512, temperature=0.7)
+            # 2. 获取生成文本的embedding（截断到self.hidden_size维）
+            generated_embeddings = self.travel_style_reward_calculator.get_embedding(generated_texts,
+                                                                                     embedding_dim=self.hidden_size)
+            generated_embeddings = torch.tensor(generated_embeddings).to(self.args.device)  # [b, l, d]
+            P_L = generated_embeddings.unsqueeze(1).expand_as(d_target_emb)
+
         if self.args.ode:
             u_o_emb_d, gamma, tau = self.encoder(o_t, o_l, o_ck, o_pad)
             z_0 = gamma + tau * torch.randn_like(tau)
-            dynamic_d_emb = self.encoder.time_proj(d_t.to(torch.float32).unsqueeze(-1)) + self.encoder.space_proj(d_l) + self.encoder.poi_emb(d_ck)
+            dynamic_d_emb = self.encoder.time_proj(d_t.to(torch.float32).unsqueeze(-1)) + self.encoder.space_proj(
+                d_l) + self.encoder.poi_emb(d_ck)
             # dynamic_d_emb = self.encoder.time_proj(d_t.to(torch.float32).unsqueeze(-1)) + self.encoder.poi_emb(d_ck)
             P_D = []
             process_loglik = torch.tensor([0.0], device=self.args.device, dtype=torch.float32)
@@ -865,11 +906,13 @@ class SPOTModel(nn.Module):
                     gt_times_unif = d_t[j][valid_idx].to(torch.float32)
                     # print("gt_times_unif:", gt_times_unif)
                     z_unif_j = odeint(self.dyf, z_0[j].unsqueeze(0), gt_times_unif,
-                                      rtol=self.args.rtol, atol=self.args.atol, method=self.args.solver, options={"min_step": 0.0001, "max_step": 100})
+                                      rtol=self.args.rtol, atol=self.args.atol, method=self.args.solver,
+                                      options={"min_step": 0.0001, "max_step": 100})
                 else:
                     s_unif = torch.linspace(0, 1, n_pred + 2, device=self.args.device, dtype=torch.float32)
                     z_unif_j = odeint(self.dyf, z_0[j].unsqueeze(0), s_unif,
-                                      rtol=self.args.rtol, atol=self.args.atol, method=self.args.solver, options={"min_step": 0.0001, "max_step": 100})
+                                      rtol=self.args.rtol, atol=self.args.atol, method=self.args.solver,
+                                      options={"min_step": 0.0001, "max_step": 100})
                 u_hat = z_unif_j.transpose(0, 1).squeeze(0)
                 P_D.append(u_hat)
                 if target_seq is not None:
@@ -900,7 +943,9 @@ class SPOTModel(nn.Module):
         model_input = torch.cat([query_emb, position_embedded], dim=2)
         encoder_output = self.transformer_encoder(model_input)
 
-        if self.args.ode and self.args.s_infer:
+        if self.args.ode and self.args.use_llm:
+            encoder_output = torch.cat([encoder_output, P_D, P_L], dim=2)
+        elif self.args.ode and self.args.s_infer:
             encoder_output = torch.cat([encoder_output, P_D, P_S], dim=2)
         elif self.args.ode:
             encoder_output = torch.cat([encoder_output, P_D], dim=2)
@@ -921,6 +966,6 @@ class SPOTModel(nn.Module):
                                                                            k=masked_poi_output.shape[1],
                                                                            dim=2)
             predicted_ids = top_np_recommendation(guidance_candidate_ids, guidance_similarity_ratio,
-                                                     confidence=torch.tensor(self.args.confidence),
-                                                     threshold=0.8)
+                                                  confidence=torch.tensor(self.args.confidence),
+                                                  threshold=0.8)
             return predicted_ids

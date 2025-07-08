@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+from email import message
+from pyexpat.errors import messages
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
@@ -20,11 +22,13 @@ import metrics
 
 import pickle
 import numbers
+
 try:
     from tqdm import tqdm
     import ipdb
 except:
     pass
+
 
 def Trans_train(args, dataloader, model, opt):
     """
@@ -34,7 +38,7 @@ def Trans_train(args, dataloader, model, opt):
     """
     model.train()
     kgdataset = dataloader
-    kgloader = DataLoader(kgdataset,batch_size=2048, drop_last=True)
+    kgloader = DataLoader(kgdataset, batch_size=2048, drop_last=True)
     trans_loss = 0.
     for data in tqdm(kgloader, total=len(kgloader), disable=True):
         heads = data[0].to(args.device)
@@ -53,10 +57,10 @@ def Trans_train(args, dataloader, model, opt):
         opt.step()
     return trans_loss.cpu().item()
 
+
 # ===================== decoding methods =========================== #
 # Advanced-Greedy:
 def find_duplicates_and_indices(input_tensor):
-
     duplicates_dict = {}
     input_tensor = input_tensor.tolist()
     for index, value in enumerate(input_tensor):
@@ -68,8 +72,8 @@ def find_duplicates_and_indices(input_tensor):
 
     return duplicates_dict
 
-def advanced_greedy_recommendation(batch_candidate, batch_similarity):
 
+def advanced_greedy_recommendation(batch_candidate, batch_similarity):
     top_candidates = batch_candidate[:, :, 0].cpu()  # [b,l]
     batch_similarity = batch_similarity.cpu()
 
@@ -93,15 +97,14 @@ def advanced_greedy_recommendation(batch_candidate, batch_similarity):
                     max_item = repetition_dict[key][confidence_list.index(max(confidence_list))]
                     left_item_list = list(filter(lambda x: x != max_item, repetition_dict[key]))
                     for left_item in left_item_list:
-
                         position_top_k[left_item] += 1
                         top_candidates[batch, left_item] = batch_candidate[batch, left_item, position_top_k[left_item]]
 
     return top_candidates
 
+
 # Top-N and Top-NP method:
 def random_choice_by_probability(probability_list):
-
     cumulative_probabilities = []
     cumulative_prob = 0
     for prob in probability_list:
@@ -116,7 +119,6 @@ def random_choice_by_probability(probability_list):
 
 
 def select_top_p_indices(probabilities, threshold=0.8):
-
     sorted_indices = np.argsort(probabilities)[::-1]  # re-order the probability
     cumulative_prob = 0.0
     selected_indices = []
@@ -129,15 +131,14 @@ def select_top_p_indices(probabilities, threshold=0.8):
 
     return selected_indices[-1]
 
-def top_n_recommendation(batch_candidate, batch_similarity, confidence=1):
 
+def top_n_recommendation(batch_candidate, batch_similarity, confidence=1):
     # the top_n method to recommend trajectory
     top_candidates = batch_candidate[:, :, 0].cpu()  # [b,l]
     batch_similarity = batch_similarity.cpu()
 
     for batch in range(batch_candidate.shape[0]):
         for middle_index in range(batch_candidate.shape[1]):
-
             # print(batch_similarity[batch, middle_index])
             batch_similarity[batch, middle_index] = F.softmax(batch_similarity[batch, middle_index] * confidence, dim=0)
             # print(batch_similarity[batch, middle_index])
@@ -148,21 +149,19 @@ def top_n_recommendation(batch_candidate, batch_similarity, confidence=1):
 
 
 def top_np_recommendation(batch_candidate, batch_similarity, confidence=0.5, threshold=0.8):
-
     # the top_np method to recommend trajectory
     top_candidates = batch_candidate[:, :, 0].cpu()  # [b,l]
     batch_similarity = batch_similarity.cpu()
 
     for batch in range(batch_candidate.shape[0]):
         for middle_index in range(batch_candidate.shape[1]):
-
             batch_similarity[batch, middle_index] = F.softmax(batch_similarity[batch, middle_index] * confidence, dim=0)
 
             top_p_indices = select_top_p_indices(batch_similarity[batch, middle_index].tolist(), threshold)
-            batch_similarity[batch, middle_index, :(top_p_indices+1)] = \
-                F.softmax(batch_similarity[batch, middle_index, :(top_p_indices+1)] * confidence, dim=0)
+            batch_similarity[batch, middle_index, :(top_p_indices + 1)] = \
+                F.softmax(batch_similarity[batch, middle_index, :(top_p_indices + 1)] * confidence, dim=0)
 
-            batch_similarity[batch, middle_index, (top_p_indices+1):] = torch.tensor(0)
+            batch_similarity[batch, middle_index, (top_p_indices + 1):] = torch.tensor(0)
 
             batch_probability_list = batch_similarity[batch, middle_index].tolist()
             nonzero_probability_list = [x for x in batch_probability_list if x != 0]
@@ -172,8 +171,8 @@ def top_np_recommendation(batch_candidate, batch_similarity, confidence=0.5, thr
 
     return top_candidates  # [b,l]
 
-def ad_top_np_recommendation(batch_candidate, batch_similarity, confidence, threshold=0.8):
 
+def ad_top_np_recommendation(batch_candidate, batch_similarity, confidence, threshold=0.8):
     # the top_np method to recommend trajectory
     top_candidates = batch_candidate[:, :, 0].cpu()  # [b,l]
     batch_similarity = batch_similarity.cpu()
@@ -182,10 +181,10 @@ def ad_top_np_recommendation(batch_candidate, batch_similarity, confidence, thre
             batch_similarity[batch, middle_index] = F.softmax(batch_similarity[batch, middle_index] *
                                                               confidence[middle_index], dim=0)
             top_p_indices = select_top_p_indices(batch_similarity[batch, middle_index].tolist(), threshold)
-            batch_similarity[batch, middle_index, :(top_p_indices+1)] = \
-                F.softmax(batch_similarity[batch, middle_index, :(top_p_indices+1)], dim=0)
+            batch_similarity[batch, middle_index, :(top_p_indices + 1)] = \
+                F.softmax(batch_similarity[batch, middle_index, :(top_p_indices + 1)], dim=0)
 
-            batch_similarity[batch, middle_index, (top_p_indices+1):] = torch.tensor(0)
+            batch_similarity[batch, middle_index, (top_p_indices + 1):] = torch.tensor(0)
 
             batch_probability_list = batch_similarity[batch, middle_index].tolist()
             nonzero_probability_list = [x for x in batch_probability_list if x != 0]
@@ -194,6 +193,7 @@ def ad_top_np_recommendation(batch_candidate, batch_similarity, confidence, thre
             top_candidates[batch, middle_index] = batch_candidate[batch, middle_index, new_top_p_index]
 
     return top_candidates
+
 
 def train_single_phase(model, train_loader, valid_loader, args, logger, kg=None, train_am=None, train_pm=None):
     """
@@ -207,6 +207,9 @@ def train_single_phase(model, train_loader, valid_loader, args, logger, kg=None,
     stopping_dict = defaultdict(float)
     flag = True
 
+    from data import create_travel_text_dataset
+    text_dataset = create_travel_text_dataset(args=args, dataset_name=args.dataset_name)
+    prompts, references = text_dataset.get_prompt_reference_pairs()
     for e in range(args.epoch):
         # pre-training
         if args.kg and args.train_trans and args.model == 'SPOT-Trip':
@@ -214,13 +217,20 @@ def train_single_phase(model, train_loader, valid_loader, args, logger, kg=None,
             trans_loss = Trans_train(args, kg, model, optimizer)
             print(f"trans Loss: {trans_loss:.3f}")
 
-        model.train() # train mode
+        model.train()  # train mode
         model.eval_p = None
         model.eval_r = None
         model.eval_p_big = None
         model.eval_r_big = None
-        loss_sum = 0. # the sum of iteration losses to get average loss in every epoch
-        for b, (uid, o_ck, d_ck, masked_d_ck, o_h, d_h, masked_d_h, o_t, d_t, o_l, d_l, o_pad, d_pad, o_rg, d_rg) in tqdm(enumerate(train_loader), total=len(train_loader)):
+        loss_sum = 0.  # the sum of iteration losses to get average loss in every epoch
+        for b, (
+        uid, o_ck, d_ck, masked_d_ck, o_h, d_h, masked_d_h, o_t, d_t, o_l, d_l, o_pad, d_pad, o_rg, d_rg) in tqdm(
+                enumerate(train_loader), total=len(train_loader)):
+            # 提取uid对应的messages，uid是tensor，需要转换为Python列表来索引prompts
+            batch_messages = [prompts[uid_item.item()] for uid_item in uid]
+            # 将messages转换为tensor并移到设备上
+            # 这里假设prompts已经是字符串，需要根据实际情况进行tokenization
+            messages = batch_messages  # 暂时保持为列表格式，具体tokenization在模型内部处理
             uid = uid.to(args.device)
             o_ck = o_ck.to(args.device)
             masked_d_ck = masked_d_ck.to(args.device)
@@ -239,7 +249,8 @@ def train_single_phase(model, train_loader, valid_loader, args, logger, kg=None,
 
             optimizer.zero_grad()
             if args.model == 'SPOT-Trip':
-                loss = model(o_ck, masked_d_ck, o_t, d_t, o_l, d_l, o_pad, d_pad, d_ck, o_rg, d_rg, target_seq=d_ck)
+                loss = model(messages, o_ck, masked_d_ck, o_t, d_t, o_l, d_l, o_pad, d_pad, d_ck, o_rg, d_rg,
+                             target_seq=d_ck)
             if args.model == 'AR-Trip':
                 poi_output, loss = model(masked_d_ck, masked_d_h, train_am, train_pm, d_ck, d_rg)
             loss.backward()
@@ -258,7 +269,11 @@ def train_single_phase(model, train_loader, valid_loader, args, logger, kg=None,
             batch_alt_f1 = []
             batch_alt_pairs_f1 = []
 
-            for b, (uid, o_ck, d_ck, masked_d_ck, o_h, d_h, masked_d_h, o_t, d_t, o_l, d_l, o_pad, d_pad, o_rg, d_rg) in enumerate(valid_loader):
+            for b, (uid, o_ck, d_ck, masked_d_ck, o_h, d_h, masked_d_h, o_t, d_t, o_l, d_l, o_pad, d_pad, o_rg,
+                    d_rg) in enumerate(valid_loader):
+                # 提取uid对应的messages，uid是tensor，需要转换为Python列表来索引prompts
+                batch_messages = [prompts[uid_item.item()] for uid_item in uid]
+                messages = batch_messages  # 暂时保持为列表格式，具体tokenization在模型内部处理
                 uid = uid.to(args.device)
                 o_ck = o_ck.to(args.device)
                 masked_d_ck = masked_d_ck.to(args.device)
@@ -275,7 +290,8 @@ def train_single_phase(model, train_loader, valid_loader, args, logger, kg=None,
                 o_rg = o_rg.to(args.device)
                 d_rg = d_rg.to(args.device)
                 if args.model == 'SPOT-Trip':
-                    predicted_ids = model(o_ck, masked_d_ck, o_t, d_t, o_l, d_l, o_pad, d_pad, d_ck, o_rg, d_rg, target_seq=None)
+                    predicted_ids = model(messages, o_ck, masked_d_ck, o_t, d_t, o_l, d_l, o_pad, d_pad, d_ck, o_rg,
+                                          d_rg, target_seq=None)
                     # Process each sample in the batch separately
                 elif args.model == 'AR-Trip':
                     poi_output, _ = model(masked_d_ck, masked_d_h, train_am, train_pm, d_ck, d_rg)
@@ -350,6 +366,7 @@ def train_single_phase(model, train_loader, valid_loader, args, logger, kg=None,
             else:
                 return best_return
 
+
 def test(model, model_path, test_loader, args, logger, n_region, train_am, train_pm):
     """
     Test the model using the provided test dataset.
@@ -367,7 +384,16 @@ def test(model, model_path, test_loader, args, logger, n_region, train_am, train
     batch_alt_pairs_f1 = []
     # for the repetition
     repetition_list = []
-    for b, (uid, o_ck, d_ck, masked_d_ck, o_h, d_h, masked_d_h, o_t, d_t, o_l, d_l, o_pad, d_pad, o_rg, d_rg) in tqdm(enumerate(test_loader), total=len(test_loader.dataset) / args.test_batch):
+
+    from data import create_travel_text_dataset
+    text_dataset = create_travel_text_dataset(args=args, dataset_name=args.dataset_name)
+    prompts, references = text_dataset.get_prompt_reference_pairs()
+
+    for b, (uid, o_ck, d_ck, masked_d_ck, o_h, d_h, masked_d_h, o_t, d_t, o_l, d_l, o_pad, d_pad, o_rg, d_rg) in tqdm(
+            enumerate(test_loader), total=len(test_loader.dataset) / args.test_batch):
+        # 提取uid对应的messages，uid是tensor，需要转换为Python列表来索引prompts
+        batch_messages = [prompts[uid_item.item()] for uid_item in uid]
+        messages = batch_messages  # 暂时保持为列表格式，具体tokenization在模型内部处理
         uid = uid.to(args.device)
         o_ck = o_ck.to(args.device)
         masked_d_ck = masked_d_ck.to(args.device)
@@ -384,7 +410,8 @@ def test(model, model_path, test_loader, args, logger, n_region, train_am, train
         o_rg = o_rg.to(args.device)
         d_rg = d_rg.to(args.device)
         if args.model == 'SPOT-Trip':
-            predicted_ids = model(o_ck, masked_d_ck, o_t, d_t, o_l, d_l, o_pad, d_pad, d_ck, o_rg, d_rg, target_seq=None)
+            predicted_ids = model(messages, o_ck, masked_d_ck, o_t, d_t, o_l, d_l, o_pad, d_pad, d_ck, o_rg, d_rg,
+                                  target_seq=None)
         if args.model == 'AR-Trip':
             poi_output, _ = model(masked_d_ck, masked_d_h, train_am, train_pm, d_ck, d_rg)
             guidance_similarity_ratio, guidance_candidate_ids = torch.topk(poi_output,

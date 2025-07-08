@@ -385,6 +385,9 @@ class TravelTextDataset(Dataset):
         
         with open(f"../{self.args.dataset_name}/city_tz_mapping.pkl", "rb") as f:
             self.city_tz_mapping = pickle.load(f)
+
+        with open(f"../{self.args.dataset_name}/poi_id.pkl", "rb") as f:
+            self.poi_idx = pickle.load(f)
         
         # 按用户ID组织数据
         self.home_data = self._organize_data_by_user(home_raw)
@@ -428,12 +431,16 @@ class TravelTextDataset(Dataset):
         
         poi_descriptions = []
         for i, point in enumerate(trajectory_data):
+            # 限制最多50个POI
+            if i >= 50:
+                break
             poi_id = point['poi_id']
             category = point['category']
             timestamp = point['timestamp']
             
             # 获取POI坐标
-            coord = self.poi_coord.get(poi_id, (0.0, 0.0))
+            poi_num_id = self.poi_idx.get(poi_id, None)
+            coord = self.poi_coord.get(poi_num_id, (0.0, 0.0))
             lat, lon = coord
             
             # 转换时间戳为UTC时间
@@ -449,7 +456,7 @@ class TravelTextDataset(Dataset):
             prompt = f"""User's travel trajectory in {region_name} (hometown):
 {trajectory_text}
 
-Based on this hometown travel pattern, what would be the user's likely travel style when visiting a destination city? Please describe their preferences for:
+Based on this hometown travel pattern, what would be the user's likely travel style when visiting a destination city? Please describe their preferences within 200 words for:
 1. Types of attractions they would visit
 2. Activity patterns and pace
 3. Overall travel behavior
@@ -460,7 +467,7 @@ Travel style prediction:"""
             prompt = f"""User's actual travel trajectory in {region_name} (destination):
 {trajectory_text}
 
-Based on this actual travel behavior in the destination city, describe the user's travel style including:
+Based on this actual travel behavior in the destination city, describe the user's travel style within 200 words including:
 1. Types of attractions they prefer
 2. Activity patterns and pace  
 3. Overall travel behavior
@@ -540,7 +547,7 @@ def create_travel_text_dataset(args, dataset_name):
         TravelTextDataset实例
     """
     home_path = f"../{dataset_name}/home.txt"
-    oot_path = f"../{dataset_name}/oot.txt" 
+    oot_path = f"../{dataset_name}/oot.txt"
     travel_path = f"../{dataset_name}/travel.txt"
     
     return TravelTextDataset(args, home_path, oot_path, travel_path)

@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from ast import parse
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "1, 2"  # Set the visible GPU device
 import torch
@@ -52,7 +53,7 @@ def main():
     parser.add_argument('--save_step', type=int, default=1)
     parser.add_argument('--test_batch', type=int, default=1)
     parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--hidden_size', type=int, default=32)
+    parser.add_argument('--hidden_size', type=int, default=128)
     parser.add_argument("--projection_dim", type=int, default=64)
 
     parser.add_argument('--margin', type=int, default=1)
@@ -101,6 +102,7 @@ def main():
     parser.add_argument("--sig_v", type=float, default=0.6, help="Observation variance.")  # Note: F 0.6 For Yelp, use 0.4
 
     parser.add_argument("--s_infer", action="store_true")
+    parser.add_argument("--use_llm", action="store_true")
 
     # Parsing command-line arguments
     args = parser.parse_args()
