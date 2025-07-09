@@ -102,7 +102,9 @@ def main():
     parser.add_argument("--sig_v", type=float, default=0.6, help="Observation variance.")  # Note: F 0.6 For Yelp, use 0.4
 
     parser.add_argument("--s_infer", action="store_true")
-    parser.add_argument("--use_llm", action="store_true")
+    parser.add_argument("--use_llm", action="store_true", help="Use LLM for training")
+    parser.add_argument("--use_target_llm", action="store_true", help="Use target LLM for training")
+    parser.add_argument("--use_vllm", action="store_true", help="Use vllm for training")
 
     # Parsing command-line arguments
     args = parser.parse_args()

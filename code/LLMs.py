@@ -8,7 +8,7 @@ LLMs.py - 大语言模型调用接口和强化学习训练模块
 """
 
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1'  # 设置可见GPU设备
+os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2'  # 设置可见GPU设备
 
 import torch
 import torch.nn as nn
@@ -28,6 +28,8 @@ import logging
 from dataclasses import dataclass
 from tqdm import tqdm
 import time
+from vllm import LLM, SamplingParams
+import logging
 
 # 导入SwanLab用于实验记录
 try:
@@ -47,7 +49,7 @@ logger = logging.getLogger(__name__)
 class TravelStyleGenerator:
     """旅游风格生成器 - 封装LLM调用"""
     
-    def __init__(self, model_name: str = "../LLMs/Qwen3-8B", device: str = "cuda"):
+    def __init__(self, model_name: str = "../LLMs/Qwen3-8B", device: str = "cuda", use_vllm= False):
         """
         初始化旅游风格生成器
 
@@ -57,225 +59,28 @@ class TravelStyleGenerator:
         """
         self.device = device
         self.model_name = model_name
-
-        # 初始化提示格式化器
-        self.prompt_formatter = TravelPromptFormatter()
+        self.use_vllm = use_vllm
+        # 禁用所有日志输出
+        logging.getLogger("vllm").setLevel(logging.CRITICAL)
 
         # 加载tokenizer和模型
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="auto",
-            torch_dtype=torch.bfloat16
-        )
+        if use_vllm:
+            self.sampling_params = SamplingParams(temperature=0.7, top_p=0.8, top_k=20, max_tokens=512)
+            self.model = LLM(model=model_name, max_model_len=4096, tensor_parallel_size=2)
+        else:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                device_map="auto",
+                torch_dtype=torch.bfloat16
+            )
 
         logger.info(f"Travel style generator initialized with {model_name}")
 
-    def generate_travel_style(self, trajectory: TravelTrajectory, target_region: str,
-                            max_length: int = 150, temperature: float = 0.7,
-                            prompt_type: str = "basic") -> str:
-        """
-        生成旅游风格描述
-
-        Args:
-            trajectory: 旅游轨迹
-            target_region: 目标地区
-            max_length: 最大生成长度
-            temperature: 生成温度
-            prompt_type: 提示类型 ('basic', 'detailed')
-
-        Returns:
-            生成的旅游风格描述
-        """
-        # 使用prompt模块生成提示
-        prompt_content = self.prompt_formatter.trajectory_to_prompt(trajectory, target_region, prompt_type)
-
-        try:
-            # 构建chat格式的消息
-            messages = [
-                {"role": "user", "content": prompt_content}
-            ]
-
-            # 使用chat模板生成文本，禁用思考模式
-            text = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=False  # 禁用Qwen3的思考模式
-            )
-
-            # 编码输入
-            inputs = self.tokenizer.encode(text, return_tensors="pt").to(self.model.device)
-
-            # 生成文本
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    inputs,
-                    max_new_tokens=max_length,
-                    temperature=temperature,
-                    do_sample=True,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    num_return_sequences=1
-                )
-
-            # 解码生成的文本
-            generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-            # 提取生成的部分（移除原始输入）
-            travel_style = generated_text[len(text):].strip()
-
-            return travel_style
-
-        except Exception as e:
-            logger.error(f"Error generating travel style: {e}")
-            return "Error in generation"
-
-    def generate_style_from_prompt(self, destination_prompt: str,
-                                 max_length: int = 150, temperature: float = 0.7) -> str:
-        """
-        从destination prompt直接生成旅游风格描述
-
-        Args:
-            destination_prompt: 包含目的地轨迹信息的提示文本
-            max_length: 最大生成长度
-            temperature: 生成温度
-
-        Returns:
-            生成的旅游风格描述
-        """
-        try:
-            # 构建chat格式的消息
-            messages = [
-                {"role": "user", "content": destination_prompt}
-            ]
-
-            # 使用chat模板生成文本，禁用思考模式
-            text = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=False  # 禁用Qwen3的思考模式
-            )
-
-            # 编码输入
-            inputs = self.tokenizer.encode(text, return_tensors="pt").to(self.model.device)
-
-            # 生成文本
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    inputs,
-                    max_new_tokens=max_length,
-                    temperature=temperature,
-                    do_sample=True,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    num_return_sequences=1,
-                    progress_bar=False  # 添加这行来关闭进度条
-                )
-
-            # 解码生成的文本
-            generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-            # 提取生成的部分（移除原始输入）
-            travel_style = generated_text[len(text):].strip()
-
-            return travel_style
-
-        except Exception as e:
-            logger.error(f"Error generating travel style from prompt: {e}")
-            return "Error in generation"
-
-    def generate_styles_from_prompts_batch(self, destination_prompts: List[str],
-                                         max_length: int = 512, temperature: float = 0.7,
-                                         batch_size: int = 4) -> List[str]:
-        """
-        批量生成旅游风格描述（支持多卡并行）
-
-        Args:
-            destination_prompts: 包含目的地轨迹信息的提示文本列表
-            max_length: 最大生成长度
-            temperature: 生成温度
-            batch_size: 批处理大小
-
-        Returns:
-            生成的旅游风格描述列表
-        """
-        results = []
-
-        # 分批处理
-        for i in range(0, len(destination_prompts), batch_size):
-            batch_prompts = destination_prompts[i:i + batch_size]
-            batch_results = self._generate_batch_internal(batch_prompts, max_length, temperature)
-            results.extend(batch_results)
-
-        return results
-
-    def _generate_batch_internal(self, prompts: List[str], max_length: int, temperature: float) -> List[str]:
-        """
-        内部批处理生成函数（利用多卡并行）
-
-        Args:
-            prompts: 提示列表
-            max_length: 最大生成长度
-            temperature: 生成温度
-
-        Returns:
-            生成结果列表
-        """
-        try:
-            # 构建所有chat格式的消息
-            all_texts = []
-
-            for prompt in prompts:
-                messages = [{"role": "user", "content": prompt}]
-                text = self.tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    enable_thinking=False
-                )
-                all_texts.append(text)
-
-            # 批量编码（利用padding支持不同长度的输入）
-            inputs = self.tokenizer(
-                all_texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=2048
-            ).to(self.model.device)
-
-            # 批量生成（模型自动利用多卡并行）
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=max_length,
-                    temperature=temperature,
-                    do_sample=True,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    num_return_sequences=1
-                )
-
-            # 批量解码
-            generated_texts = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
-
-            # 提取生成的部分
-            results = []
-            for i, generated_text in enumerate(generated_texts):
-                original_length = len(all_texts[i])
-                travel_style = generated_text[original_length:].strip()
-                results.append(travel_style)
-
-            return results
-
-        except Exception as e:
-            logger.error(f"Error in batch generation: {e}")
-            # 降级到单个生成
-            return [self.generate_style_from_prompt(prompt, max_length, temperature) for prompt in prompts]
-
-    def get_output(self, messages: List[str], max_length: int = 150, 
+    def get_output(self, messages: List[str], max_length: int = 256,
                    temperature: float = 0.7, batch_size: int = 4) -> List[str]:
         """
         批量生成文本输出
@@ -324,6 +129,14 @@ class TravelStyleGenerator:
                     enable_thinking=False
                 )
                 all_texts.append(text)
+            if self.use_vllm:
+                # 使用vLLM进行批量生成
+                outputs = self.model.generate(
+                    all_texts,
+                    sampling_params=self.sampling_params
+                )
+                generated_texts = [output.outputs[0].text for output in outputs]
+                return generated_texts
 
             # 批量编码（利用padding支持不同长度的输入）
             inputs = self.tokenizer(
@@ -371,14 +184,14 @@ class TravelStyleGenerator:
 class TravelStyleRewardCalculator:
     """旅游风格相似度计算和奖励函数"""
 
-    def __init__(self, similarity_model: str = "../LLMs/Qwen3-Embedding-0.6B"):
+    def __init__(self, similarity_model: str = "../LLMs/Qwen3-Embedding-4B"):
         """
         初始化奖励计算器
 
         Args:
             similarity_model: 用于计算文本相似度的模型
         """
-        self.similarity_model = SentenceTransformer(similarity_model)
+        self.similarity_model = SentenceTransformer(similarity_model, device="cuda:2")
         logger.info(f"Reward calculator initialized with {similarity_model}")
 
     def calculate_similarity(self, text1: str, text2: str) -> float:
@@ -481,6 +294,7 @@ def travel_style_similarity_reward_func(similarity_model, prompts, completions, 
     旅游风格相似度奖励函数
 
     Args:
+        similarity_model: 用于计算相似度的模型实例
         prompts: 输入的prompt列表
         completions: 模型生成的completion列表
         reference_responses: 参考答案列表
@@ -489,11 +303,7 @@ def travel_style_similarity_reward_func(similarity_model, prompts, completions, 
     Returns:
         list[float]: 奖励值列表
     """
-    from sentence_transformers import SentenceTransformer
     from sklearn.metrics.pairwise import cosine_similarity
-
-    # 初始化相似度模型
-    # similarity_model = SentenceTransformer("../LLMs/Qwen3-Embedding-0.6B")
 
     responses = [completion[0]['content'] if isinstance(completion, list) else completion for completion in completions]
     rewards = []
@@ -517,7 +327,7 @@ def travel_style_similarity_reward_func(similarity_model, prompts, completions, 
                 similarity = max(0.0, min(1.0, similarity))
 
                 # 将相似度转换为奖励分数
-                reward = similarity * 2.0  # 放大奖励范围
+                reward = similarity
                 rewards.append(reward)
 
                 # 打印详细信息
@@ -593,80 +403,6 @@ def travel_style_length_reward_func(prompts, completions, reference_responses, *
 
     avg_length_reward = sum(rewards) / len(rewards) if rewards else 0.0
     print(f"\n平均长度奖励: {avg_length_reward:.4f}")
-    print(f"{'='*80}\n")
-
-    return rewards
-
-def travel_style_content_quality_reward_func(prompts, completions, **kwargs) -> list[float]:
-    """
-    旅游风格内容质量奖励函数
-    检查生成的旅游风格描述是否包含关键要素
-
-    Args:
-        prompts: 输入的prompt列表
-        completions: 模型生成的completion列表
-        **kwargs: 其他可选参数
-
-    Returns:
-        list[float]: 奖励值列表
-    """
-    responses = [completion[0]['content'] if isinstance(completion, list) else completion for completion in completions]
-    rewards = []
-
-    # 定义旅游风格关键词
-    key_elements = [
-        ['attraction', 'museum', 'park', 'landmark', 'site'],  # 景点类型
-        ['activity', 'walking', 'sightseeing', 'shopping', 'dining'],  # 活动类型
-        ['pace', 'schedule', 'time', 'leisurely', 'fast'],  # 节奏相关
-        ['prefer', 'like', 'enjoy', 'interest', 'style']  # 偏好相关
-    ]
-
-    print(f"\n{'='*80}")
-    print(f"内容质量奖励函数计算 - 处理 {len(responses)} 个生成结果")
-    print(f"{'='*80}")
-
-    for idx, response in enumerate(responses):
-        response_lower = response.lower()
-        quality_score = 0.0
-        quality_details = []
-
-        # 检查是否包含各类关键要素
-        for i, element_group in enumerate(key_elements):
-            group_names = ['景点类型', '活动类型', '节奏相关', '偏好相关']
-            if any(keyword in response_lower for keyword in element_group):
-                quality_score += 0.25
-                found_keywords = [kw for kw in element_group if kw in response_lower]
-                quality_details.append(f"{group_names[i]}: {found_keywords}")
-
-        # 检查长度是否合适（20-100词）
-        word_count = len(response.split())
-        if 20 <= word_count <= 100:
-            quality_score += 0.5
-            quality_details.append(f"长度合适: {word_count}词")
-        else:
-            quality_details.append(f"长度不合适: {word_count}词 (建议20-100词)")
-
-        # 检查是否包含具体描述（避免过于抽象）
-        sentence_count = len(response.split('.'))
-        if sentence_count >= 2:  # 至少两个句子
-            quality_score += 0.25
-            quality_details.append(f"句子数量充足: {sentence_count}句")
-        else:
-            quality_details.append(f"句子数量不足: {sentence_count}句")
-
-        rewards.append(quality_score)
-
-        # 打印详细信息
-        print(f"\n样本 {idx+1}:")
-        print(f"生成回复: {response[:200]}..." if len(response) > 200 else f"生成回复: {response}")
-        print(f"质量评分细节:")
-        for detail in quality_details:
-            print(f"  - {detail}")
-        print(f"总质量奖励: {quality_score:.4f}")
-        print(f"{'-'*60}")
-
-    avg_quality_reward = sum(rewards) / len(rewards) if rewards else 0.0
-    print(f"\n平均质量奖励: {avg_quality_reward:.4f}")
     print(f"{'='*80}\n")
 
     return rewards
@@ -816,53 +552,30 @@ class TravelStyleGRPOTrainer:
                     '失败': failed_count
                 })
 
-                try:
-                    # 批量生成参考答案
-                    batch_references = destination_generator.generate_styles_from_prompts_batch(
-                        batch_destination_prompts,
-                        max_length=512,
-                        temperature=0.7,
-                        batch_size=batch_size
-                    )
 
-                    # 处理批次结果
-                    for i, reference_style in enumerate(batch_references):
-                        actual_index = batch_start + i
-                        if reference_style != "Error in generation":
-                            queries.append(hometown_prompts[actual_index])
-                            reference_responses.append(reference_style)
-                            successful_count += 1
+                # 批量生成参考答案
+                batch_references = destination_generator.get_output(batch_destination_prompts, max_length=512, temperature=0.7)
 
-                            # 详细日志（每50个样本打印一次）
-                            if successful_count % 50 == 0:
-                                current_info = batch_item_info[i]
-                                print(f"\n📊 已成功处理 {successful_count} 个样本")
-                                print(f"   当前样本 - 用户: {current_info['uid']}, 目标: {current_info['dst_region']}")
-                                print(f"   Reference长度: {len(reference_style)} 字符")
-                                print(f"   Reference预览: {reference_style[:100]}...")
-                                print(f"{'-'*60}")
-                        else:
-                            failed_count += 1
+                # 处理批次结果
+                for i, reference_style in enumerate(batch_references):
+                    actual_index = batch_start + i
+                    if reference_style != "Error in generation":
+                        queries.append(hometown_prompts[actual_index])
+                        reference_responses.append(reference_style)
+                        successful_count += 1
+
+                        # 详细日志（每50个样本打印一次）
+                        if successful_count % 50 == 0:
                             current_info = batch_item_info[i]
-                            logger.warning(f"Failed to generate reference for user {current_info['uid']}")
-
-                except Exception as e:
-                    # 批处理失败时，降级到单个处理
-                    print(f"\n⚠️  批处理失败，降级到单个处理: {e}")
-                    for i, destination_prompt in enumerate(batch_destination_prompts):
-                        try:
-                            reference_style = destination_generator.generate_style_from_prompt(destination_prompt)
-                            actual_index = batch_start + i
-                            if reference_style != "Error in generation":
-                                queries.append(hometown_prompts[actual_index])
-                                reference_responses.append(reference_style)
-                                successful_count += 1
-                            else:
-                                failed_count += 1
-                        except Exception as single_e:
-                            failed_count += 1
-                            current_info = batch_item_info[i]
-                            logger.warning(f"Failed to generate reference for user {current_info['uid']}: {single_e}")
+                            print(f"\n📊 已成功处理 {successful_count} 个样本")
+                            print(f"   当前样本 - 用户: {current_info['uid']}, 目标: {current_info['dst_region']}")
+                            print(f"   Reference长度: {len(reference_style)} 字符")
+                            print(f"   Reference预览: {reference_style[:100]}...")
+                            print(f"{'-'*60}")
+                    else:
+                        failed_count += 1
+                        current_info = batch_item_info[i]
+                        logger.warning(f"Failed to generate reference for user {current_info['uid']}")
 
                 # 更新最终进度
                 batch_progress.set_postfix({
@@ -972,7 +685,6 @@ class TravelStyleGRPOTrainer:
 
         Args:
             text_dataset: datasets实例，用于文本描述训练
-            trajectories: 兼容性参数，轨迹数据
             output_dir: 输出目录
             run_name: 运行名称
             num_train_epochs: 训练轮数
@@ -1063,7 +775,7 @@ class TravelStyleGRPOTrainer:
             save_steps=save_steps,
             max_grad_norm=0.1,
             log_on_each_node=False,
-            use_vllm=False,
+            use_vllm=True,
         )
 
         # 定义奖励函数，传入reference_responses和进度跟踪作为闭包变量
@@ -1077,7 +789,15 @@ class TravelStyleGRPOTrainer:
             })
 
             print(f"\n🔄 步骤 {self.current_step}/{self.total_steps}: 相似度奖励计算")
-            return travel_style_similarity_reward_func(self.similarity_model, prompts, completions, reference, **kwargs)
+            similarity_rewards = travel_style_similarity_reward_func(self.similarity_model, prompts, completions, reference, **kwargs)
+            # 记录到SwanLab
+            if SWANLAB_AVAILABLE:
+                swanlab.log({
+                    "step": self.current_step,
+                    "reward/similarity": sum(similarity_rewards) / len(similarity_rewards) if similarity_rewards else 0.0,
+                    "progress": (self.current_step/self.total_steps)*100
+                })
+            return similarity_rewards
 
         def length_reward_func(prompts, completions, reference, **kwargs):
             self.training_progress.set_postfix({
@@ -1122,7 +842,7 @@ class TravelStyleGRPOTrainer:
             model=self.model,
             processing_class=self.tokenizer,
             reward_funcs=[
-                quality_reward_func,
+                similarity_reward_func,
             ],
             args=training_args,
             train_dataset=dataset,
@@ -1183,56 +903,6 @@ class TravelStyleGRPOTrainer:
         print(f"GRPO强化学习训练完成!")
         print(f"{'='*100}\n")
 
-    def evaluate(self, test_trajectories: List[Tuple[TravelTrajectory, TravelTrajectory, str]]) -> Dict[str, float]:
-        """
-        评估模型性能
-
-        Args:
-            test_trajectories: 测试轨迹数据
-
-        Returns:
-            评估指标
-        """
-        total_reward = 0.0
-        total_similarity = 0.0
-        num_samples = len(test_trajectories)
-
-        generator = TravelStyleGenerator(self.model_name, self.device)
-        # 如果使用了LoRA训练，需要将训练后的模型设置给generator
-        if hasattr(self, 'model'):
-            generator.model = self.model
-
-        for hometown_traj, destination_traj, destination_name in test_trajectories:
-            # 生成预测风格
-            predicted_style = generator.generate_travel_style(hometown_traj, destination_name)
-
-            # 生成实际风格作为参考
-            actual_style = generator.generate_travel_style(destination_traj, destination_name)
-
-            # 计算奖励和相似度
-            reward = self.reward_calculator.calculate_reward(predicted_style, actual_style)
-            similarity = self.reward_calculator.calculate_similarity(predicted_style, actual_style)
-
-            total_reward += reward
-            total_similarity += similarity
-
-        results = {
-            "average_reward": total_reward / num_samples,
-            "average_similarity": total_similarity / num_samples,
-            "num_samples": num_samples
-        }
-
-        # 记录评估结果到SwanLab
-        if SWANLAB_AVAILABLE:
-            swanlab.log({
-                "eval/average_reward": results["average_reward"],
-                "eval/average_similarity": results["average_similarity"],
-                "eval/num_samples": results["num_samples"]
-            })
-            logger.info("Evaluation results logged to SwanLab")
-
-        return results
-
 def main():
     """主函数 - 演示使用方法"""
     import wandb
@@ -1248,7 +918,7 @@ def main():
 
     # 准备训练和测试数据
     from datasets import load_from_disk
-    text_dataset = load_from_disk("../dataset/travel_dataset_20250703_210725")
+    text_dataset = load_from_disk("../dataset/travel_dataset_20250708_193154")
 
     # 训练模型
     trainer.train(

@@ -223,11 +223,17 @@ def train_single_phase(model, train_loader, valid_loader, args, logger, kg=None,
         model.eval_p_big = None
         model.eval_r_big = None
         loss_sum = 0.  # the sum of iteration losses to get average loss in every epoch
+        number = len(train_loader)
         for b, (
         uid, o_ck, d_ck, masked_d_ck, o_h, d_h, masked_d_h, o_t, d_t, o_l, d_l, o_pad, d_pad, o_rg, d_rg) in tqdm(
                 enumerate(train_loader), total=len(train_loader)):
-            # 提取uid对应的messages，uid是tensor，需要转换为Python列表来索引prompts
-            batch_messages = [prompts[uid_item.item()] for uid_item in uid]
+            print("batch: %d/%d" % (b, number), end='\r')
+            if args.use_target_llm:
+                # 提取uid对应的references，uid是tensor，需要转换为Python列表来索引prompts
+                batch_messages = [references[uid_item.item()] for uid_item in uid]
+            else:
+                # 提取uid对应的messages，uid是tensor，需要转换为Python列表来索引prompts
+                batch_messages = [prompts[uid_item.item()] for uid_item in uid]
             # 将messages转换为tensor并移到设备上
             # 这里假设prompts已经是字符串，需要根据实际情况进行tokenization
             messages = batch_messages  # 暂时保持为列表格式，具体tokenization在模型内部处理
@@ -271,8 +277,12 @@ def train_single_phase(model, train_loader, valid_loader, args, logger, kg=None,
 
             for b, (uid, o_ck, d_ck, masked_d_ck, o_h, d_h, masked_d_h, o_t, d_t, o_l, d_l, o_pad, d_pad, o_rg,
                     d_rg) in enumerate(valid_loader):
-                # 提取uid对应的messages，uid是tensor，需要转换为Python列表来索引prompts
-                batch_messages = [prompts[uid_item.item()] for uid_item in uid]
+                if args.use_target_llm:
+                    # 提取uid对应的references，uid是tensor，需要转换为Python列表来索引prompts
+                    batch_messages = [references[uid_item.item()] for uid_item in uid]
+                else:
+                    # 提取uid对应的messages，uid是tensor，需要转换为Python列表来索引prompts
+                    batch_messages = [prompts[uid_item.item()] for uid_item in uid]
                 messages = batch_messages  # 暂时保持为列表格式，具体tokenization在模型内部处理
                 uid = uid.to(args.device)
                 o_ck = o_ck.to(args.device)
@@ -391,8 +401,12 @@ def test(model, model_path, test_loader, args, logger, n_region, train_am, train
 
     for b, (uid, o_ck, d_ck, masked_d_ck, o_h, d_h, masked_d_h, o_t, d_t, o_l, d_l, o_pad, d_pad, o_rg, d_rg) in tqdm(
             enumerate(test_loader), total=len(test_loader.dataset) / args.test_batch):
-        # 提取uid对应的messages，uid是tensor，需要转换为Python列表来索引prompts
-        batch_messages = [prompts[uid_item.item()] for uid_item in uid]
+        if args.use_target_llm:
+            # 提取uid对应的references，uid是tensor，需要转换为Python列表来索引prompts
+            batch_messages = [references[uid_item.item()] for uid_item in uid]
+        else:
+            # 提取uid对应的messages，uid是tensor，需要转换为Python列表来索引prompts
+            batch_messages = [prompts[uid_item.item()] for uid_item in uid]
         messages = batch_messages  # 暂时保持为列表格式，具体tokenization在模型内部处理
         uid = uid.to(args.device)
         o_ck = o_ck.to(args.device)

@@ -405,7 +405,7 @@ class SPOTModel(nn.Module):
 
         super(SPOTModel, self).__init__()
         # initial LLMs
-        self.travel_style_generator = TravelStyleGenerator()
+        self.travel_style_generator = TravelStyleGenerator(use_vllm=args.use_vllm)
         self.travel_style_reward_calculator = TravelStyleRewardCalculator()
         # initial hyperparameter
         self.hidden_size = d_model
