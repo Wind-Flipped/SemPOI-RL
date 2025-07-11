@@ -18,3 +18,32 @@ Simply run the following command to train and evaluate:
 cd ./code
 python main.py --ori_data {...} --dst_data {...} --trans_data {...} --save_path {...} --model SPOT-Trip --mode train --kg --train_trans --ode --s_infer
 ```
+
+
+## Prepare Text Data
+If you want to use text data, you need to prepare the text data first. You can run the following command to prepare the text data:
+```cmd
+cd ./code
+python prepare_prompts.py --dataset_name Foursquare --batch_size 4
+```
+
+## Train
+To train the model, you can run the following command:
+```cmd
+cd ./code
+python main.py --model SPOT-Trip --mode train --train_trans --ode --s_infer --use_llm
+```
+
+## Train with target LLM
+If you want to train the model with a specific LLM, you can run the following command:
+```cmd
+cd ./code
+python main.py --model SPOT-Trip --mode train --train_trans --ode --s_infer --use_llm --use_target_llm
+```
+
+## RL for Training
+If you want to train the model with RL, you can run the following command:
+```cmd
+cd ./code
+NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python LLMs.py
+```

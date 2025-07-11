@@ -31,6 +31,13 @@ import time
 from vllm import LLM, SamplingParams
 import logging
 
+# 导入accelerate库进行分布式训练
+try:
+    from accelerate import Accelerator
+    ACCELERATE_AVAILABLE = True
+except ImportError:
+    ACCELERATE_AVAILABLE = False
+
 # 导入SwanLab用于实验记录
 try:
     import swanlab
@@ -412,12 +419,13 @@ class TravelStyleGRPOTrainer:
 
     def __init__(self,
                  model_name: str = "../LLMs/Qwen3-8B",
-                 similarity_model_name: str = "../LLMs/Qwen3-Embedding-0.6B",
+                 similarity_model_name: str = "../LLMs/Qwen3-Embedding-4B",
                  device: str = "cuda",
                  use_lora: bool = True,
                  lora_r: int = 16,
                  lora_alpha: int = 32,
-                 lora_dropout: float = 0.1):
+                 lora_dropout: float = 0.1,
+                 use_accelerate: bool = False):
         """
         初始化GRPO训练器
 
@@ -428,10 +436,18 @@ class TravelStyleGRPOTrainer:
             lora_r: LoRA的r参数
             lora_alpha: LoRA的alpha参数
             lora_dropout: LoRA的dropout率
+            use_accelerate: 是否使用accelerate库
         """
         self.device = device
         self.model_name = model_name
         self.use_lora = use_lora
+        self.use_accelerate = use_accelerate and ACCELERATE_AVAILABLE
+        
+        # 初始化accelerator
+        if self.use_accelerate:
+            self.accelerator = Accelerator()
+        else:
+            self.accelerator = None
 
         # 训练进度跟踪
         self.training_progress = None
@@ -441,7 +457,7 @@ class TravelStyleGRPOTrainer:
         from sentence_transformers import SentenceTransformer
 
         # 初始化相似度模型
-        self.similarity_model = SentenceTransformer("../LLMs/Qwen3-Embedding-0.6B")
+        self.similarity_model = SentenceTransformer(similarity_model_name, device="cuda:2")
 
         # 加载tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -449,11 +465,19 @@ class TravelStyleGRPOTrainer:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # 加载模型
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="auto",
-            torch_dtype=torch.bfloat16
-        )
+        if self.use_accelerate:
+            # 使用accelerate时不设置device_map
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.bfloat16
+            )
+        else:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                device_map="auto",
+                max_memory={0: "20GiB", 1: "20GiB", 2: "0GiB"},
+                torch_dtype=torch.bfloat16
+            )
 
         # 配置LoRA
         if self.use_lora:
@@ -466,10 +490,9 @@ class TravelStyleGRPOTrainer:
             )
             self.model = get_peft_model(self.model, lora_config)
 
-        # 初始化奖励计算器
-        self.reward_calculator = TravelStyleRewardCalculator()
-
-        logger.info("GRPO trainer initialized with LoRA" if use_lora else "GRPO trainer initialized")
+        logger.info("GRPO trainer initialized with LoRA and Accelerate" if (use_lora and self.use_accelerate) 
+                   else "GRPO trainer initialized with LoRA" if use_lora 
+                   else "GRPO trainer initialized")
 
     def prepare_dataset(self, text_dataset=None, save_dataset=True, batch_size=4) -> Dict:
         """
@@ -672,13 +695,13 @@ class TravelStyleGRPOTrainer:
               output_dir: str = "./grpo_travel_style_model",
               run_name: str = "travel_style_grpo",
               num_train_epochs: int = 1,
-              learning_rate: float = 5e-6,
+              learning_rate: float = 5e-5,
               per_device_train_batch_size: int = 2,
               gradient_accumulation_steps: int = 2,
               num_generations: int = 4,
-              max_prompt_length: int = 512,
+              max_prompt_length: int = 3072,
               max_completion_length: int = 256,
-              save_steps: int = 100,
+              save_steps: int = 250,
               logging_steps: int = 1):
         """
         使用GRPO训练模型
@@ -761,8 +784,8 @@ class TravelStyleGRPOTrainer:
             learning_rate=learning_rate,
             adam_beta1=0.9,
             adam_beta2=0.99,
-            weight_decay=0.1,
-            warmup_ratio=0.1,
+            # weight_decay=0.1,
+            # warmup_ratio=0.1,
             lr_scheduler_type='cosine',
             logging_steps=logging_steps,
             bf16=True,
@@ -775,7 +798,7 @@ class TravelStyleGRPOTrainer:
             save_steps=save_steps,
             max_grad_norm=0.1,
             log_on_each_node=False,
-            use_vllm=True,
+            use_vllm=False,
         )
 
         # 定义奖励函数，传入reference_responses和进度跟踪作为闭包变量
@@ -838,20 +861,35 @@ class TravelStyleGRPOTrainer:
             return total_rewards
 
         # 创建GRPO训练器
-        trainer = GRPOTrainer(
-            model=self.model,
-            processing_class=self.tokenizer,
-            reward_funcs=[
-                similarity_reward_func,
-            ],
-            args=training_args,
-            train_dataset=dataset,
-        )
+        if self.use_accelerate:
+            # 使用accelerate准备模型和数据集
+            model, dataset = self.accelerator.prepare(self.model, dataset)
+            trainer = GRPOTrainer(
+                model=model,
+                processing_class=self.tokenizer,
+                reward_funcs=[
+                    similarity_reward_func,
+                ],
+                args=training_args,
+                train_dataset=dataset,
+            )
+        else:
+            trainer = GRPOTrainer(
+                model=self.model,
+                processing_class=self.tokenizer,
+                reward_funcs=[
+                    similarity_reward_func,
+                ],
+                args=training_args,
+                train_dataset=dataset,
+            )
 
         logger.info("Starting GRPO training...")
         print(f"\n🚀 开始强化学习训练...")
         print(f"模型: {self.model_name}")
         print(f"使用LoRA: {'是' if self.use_lora else '否'}")
+        if self.use_accelerate:
+            print(f"使用 accelerate: 是")
 
         # 记录训练开始时间
         start_time = time.time()
@@ -906,14 +944,18 @@ class TravelStyleGRPOTrainer:
 def main():
     """主函数 - 演示使用方法"""
     import wandb
+    import argparse
     wandb.init(mode="disabled")  # 强制禁用 wandb
-
-    # 初始化训练器（使用LoRA）
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--use_accelerate", action="store_true", help="是否使用accelerate加速")
+    args = parser.parse_args()
+    # 初始化训练器（使用LoRA和accelerate）
     trainer = TravelStyleGRPOTrainer(
         model_name="../LLMs/Qwen3-8B",
         use_lora=True,
         lora_r=16,
-        lora_alpha=32
+        lora_alpha=32,
+        use_accelerate=args.use_accelerate  # 启用accelerate支持
     )
 
     # 准备训练和测试数据
@@ -925,9 +967,9 @@ def main():
         text_dataset=text_dataset,
         output_dir="./grpo_travel_style_lora_model",
         run_name="travel_style_grpo_lora",
-        num_train_epochs=1,
-        per_device_train_batch_size=2,  # 减小批次大小适应示例数据
-        gradient_accumulation_steps=4
+        num_train_epochs=10,
+        per_device_train_batch_size=1,  # 减小批次大小适应示例数据
+        gradient_accumulation_steps=8
     )
 
     # 评估模型

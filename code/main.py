@@ -105,6 +105,7 @@ def main():
     parser.add_argument("--use_llm", action="store_true", help="Use LLM for training")
     parser.add_argument("--use_target_llm", action="store_true", help="Use target LLM for training")
     parser.add_argument("--use_vllm", action="store_true", help="Use vllm for training")
+    parser.add_argument("--llm_embedding_dim", type=int, default=256, help="Embedding dimension for LLM")
 
     # Parsing command-line arguments
     args = parser.parse_args()

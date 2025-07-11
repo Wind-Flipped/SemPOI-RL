@@ -405,11 +405,12 @@ class SPOTModel(nn.Module):
 
         super(SPOTModel, self).__init__()
         # initial LLMs
-        self.travel_style_generator = TravelStyleGenerator(use_vllm=args.use_vllm)
         self.travel_style_reward_calculator = TravelStyleRewardCalculator()
+        self.travel_style_generator = TravelStyleGenerator(use_vllm=args.use_vllm)
         # initial hyperparameter
         self.hidden_size = d_model
         self.args = args
+        self.llm_embedding_dim = args.llm_embedding_dim if args.use_llm else 0
         # model setting
         self.poi_embedding = POIEmbeddings(poi_size, self.hidden_size)
         self.poi_size = poi_size
@@ -450,12 +451,14 @@ class SPOTModel(nn.Module):
 
         self.transformer_encoder = TransformerModel(embed_size=self.hidden_size * 2, nhead=n_head,
                                                     nhid=2048, nlayers=num_encoder_layers)
+        self.transformer_encoder2 = TransformerModel(embed_size=self.hidden_size, nhead=n_head,
+                                                    nhid=2048, nlayers=num_encoder_layers)
         self.infer_layer = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size),
             nn.SiLU()
         )
         if self.args.ode and self.args.use_llm:
-            self.predictor = Recommender(self.hidden_size * 4, poi_size)
+            self.predictor = Recommender(self.hidden_size * 2 + self.llm_embedding_dim, poi_size)
         elif self.args.ode and self.args.s_infer:
             self.predictor = Recommender(self.hidden_size * 4, poi_size)
         elif self.args.ode or self.args.s_infer:
@@ -883,12 +886,15 @@ class SPOTModel(nn.Module):
             self.args.kg = False
             self.args.s_infer = False
             # 1. 通过LLM生成文本
-            generated_texts = self.travel_style_generator.get_output(messages, max_length=512, temperature=0.7)
+            if self.args.use_target_llm:
+                generated_texts = messages
+            else:
+                generated_texts = self.travel_style_generator.get_output(messages, max_length=512, temperature=0.7)
             # 2. 获取生成文本的embedding（截断到self.hidden_size维）
             generated_embeddings = self.travel_style_reward_calculator.get_embedding(generated_texts,
-                                                                                     embedding_dim=self.hidden_size)
-            generated_embeddings = torch.tensor(generated_embeddings).to(self.args.device)  # [b, l, d]
-            P_L = generated_embeddings.unsqueeze(1).expand_as(d_target_emb)
+                                                                                     embedding_dim=self.llm_embedding_dim)
+            generated_embeddings = torch.tensor(generated_embeddings).to(self.args.device)  # [b, d]
+            P_L = generated_embeddings.unsqueeze(1).expand([generated_embeddings.shape[0], d_target_emb.shape[1], generated_embeddings.shape[1]])
 
         if self.args.ode:
             u_o_emb_d, gamma, tau = self.encoder(o_t, o_l, o_ck, o_pad)
@@ -940,8 +946,11 @@ class SPOTModel(nn.Module):
         position_ids = torch.arange(seq_length, dtype=torch.long, device=query.device)
         position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
         position_embedded = self.pos_emb(position_ids)
-        model_input = torch.cat([query_emb, position_embedded], dim=2)
-        encoder_output = self.transformer_encoder(model_input)
+        if self.args.use_llm:
+            encoder_output = self.transformer_encoder2(position_embedded)
+        else:
+            model_input = torch.cat([query_emb, position_embedded], dim=2)
+            encoder_output = self.transformer_encoder(model_input)
 
         if self.args.ode and self.args.use_llm:
             encoder_output = torch.cat([encoder_output, P_D, P_L], dim=2)
