@@ -515,7 +515,7 @@ class TravelStyleGRPOTrainer:
                    else "GRPO trainer initialized with LoRA" if use_lora 
                    else "GRPO trainer initialized")
 
-    def prepare_dataset(self, text_dataset=None, save_dataset=True, batch_size=4) -> Dict:
+    def prepare_dataset(self, text_dataset=None, save_dataset=True, dataset_name = None, batch_size=4) -> Dict:
         """
         准备训练数据集
 
@@ -523,6 +523,7 @@ class TravelStyleGRPOTrainer:
             text_dataset: TravelTextDataset实例，用于生成文本描述
             trajectories: 兼容性参数，包含(家乡轨迹, 目的地轨迹, 目的地名称)的元组列表
             save_dataset: 是否保存数据集到本地
+            dataset_name: 数据集名称，用于保存文件名
             batch_size: 批处理大小，用于并行生成
 
         Returns:
@@ -660,7 +661,7 @@ class TravelStyleGRPOTrainer:
                 # 生成时间戳文件名
                 import datetime
                 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                dataset_name = f"travel_dataset_{timestamp}"
+                dataset_name = f"{dataset_name}_{timestamp}"
                 dataset_path = os.path.join(dataset_dir, dataset_name)
 
                 # 保存dataset

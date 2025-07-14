@@ -116,6 +116,7 @@ def main():
         dataset, reference_responses = trainer.prepare_dataset(
             text_dataset=text_dataset,
             save_dataset=args.save_dataset,
+            dataset_name=args.dataset_name,
             batch_size=args.batch_size
         )
 

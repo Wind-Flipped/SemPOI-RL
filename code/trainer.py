@@ -275,6 +275,8 @@ def train_single_phase(model, train_loader, valid_loader, args, logger, kg=None,
         if flag:
             batch_alt_f1 = []
             batch_alt_pairs_f1 = []
+            batch_alt_all_f1 = []
+            batch_alt_pairs_all_f1 = []
 
             for b, (uid, o_ck, d_ck, masked_d_ck, o_h, d_h, masked_d_h, o_t, d_t, o_l, d_l, o_pad, d_pad, o_rg,
                     d_rg) in enumerate(valid_loader):
@@ -334,14 +336,23 @@ def train_single_phase(model, train_loader, valid_loader, args, logger, kg=None,
                     # # Calculate F1 score and pairs F1 score for the current sample
                     # sample_f1 = metrics.f1_score(sample_target, alt_sample_pred)
                     # sample_pairs_f1 = metrics.pairs_f1_score(sample_target, alt_sample_pred)
+                    full_sample_f1 = metrics.f1_score(torch.cat([torch.tensor([-1]), sample_target, torch.tensor([-2])]),
+                                                      torch.cat([torch.tensor([-1]), sample_pred, torch.tensor([-2])]))
+                    full_sample_pairs_f1 = metrics.pairs_f1_score(
+                        torch.cat([torch.tensor([-1]), sample_target, torch.tensor([-2])]),
+                        torch.cat([torch.tensor([-1]), sample_pred, torch.tensor([-2])]))
 
                     batch_alt_f1.append(sample_f1)
                     batch_alt_pairs_f1.append(sample_pairs_f1)
+                    batch_alt_all_f1.append(full_sample_f1)
+                    batch_alt_pairs_all_f1.append(full_sample_pairs_f1)
 
             alt_f1 = np.mean(batch_alt_f1)
             alt_pairs_f1 = np.mean(batch_alt_pairs_f1)
-            logger.log("[val] Epoch {}/{} F1-Score: {:5.4f} Pairs-F1-Score: {:5.4f}" \
-                       .format(e, args.epoch - 1, alt_f1, alt_pairs_f1))
+            alt_all_f1 = np.mean(batch_alt_all_f1)
+            alt_pairs_all_f1 = np.mean(batch_alt_pairs_all_f1)
+            logger.log("[val] Epoch {}/{} F1-Score: {:5.4f} Pairs-F1-Score: {:5.4f}. All-F1-Score: {:5.4f} All-Pairs-F1-Score: {:5.4f}." \
+                       .format(e, args.epoch - 1, alt_f1, alt_pairs_f1, alt_all_f1, alt_pairs_all_f1))
 
         # early stop
         if flag:
@@ -393,6 +404,8 @@ def test(model, model_path, test_loader, args, logger, n_region, train_am, train
 
     batch_alt_f1 = []
     batch_alt_pairs_f1 = []
+    batch_alt_all_f1 = []
+    batch_alt_pairs_all_f1 = []
     # for the repetition
     repetition_list = []
 
@@ -458,9 +471,16 @@ def test(model, model_path, test_loader, args, logger, n_region, train_am, train
             # # Calculate F1 score and pairs F1 score for the current sample
             # sample_f1 = metrics.f1_score(sample_target, alt_sample_pred)
             # sample_pairs_f1 = metrics.pairs_f1_score(sample_target, alt_sample_pred)
+            full_sample_f1 = metrics.f1_score(torch.cat([torch.tensor([-1]), sample_target, torch.tensor([-2])]),
+                                              torch.cat([torch.tensor([-1]), sample_pred, torch.tensor([-2])]))
+            full_sample_pairs_f1 = metrics.pairs_f1_score(
+                torch.cat([torch.tensor([-1]), sample_target, torch.tensor([-2])]),
+                torch.cat([torch.tensor([-1]), sample_pred, torch.tensor([-2])]))
 
             batch_alt_f1.append(sample_f1)
             batch_alt_pairs_f1.append(sample_pairs_f1)
+            batch_alt_all_f1.append(full_sample_f1)
+            batch_alt_pairs_all_f1.append(full_sample_pairs_f1)
 
             repetition_ratio = metrics.count_adjacent_repetition_rate(alt_sample_pred)
             repetition_list.append(repetition_ratio)
@@ -468,5 +488,6 @@ def test(model, model_path, test_loader, args, logger, n_region, train_am, train
     repetition = np.mean(repetition_list)
     alt_f1 = np.mean(batch_alt_f1)
     alt_pairs_f1 = np.mean(batch_alt_pairs_f1)
-    logger.log("[test-general] F1-Score: {:5.4f} Pairs-F1-Score: {:5.4f} Repetition: {:5.4f}" \
-               .format(alt_f1, alt_pairs_f1, repetition))
+    logger.log("[test-general] F1-Score: {:5.4f} Pairs-F1-Score: {:5.4f} Repetition: {:5.4f}. All-F1-Score: {:5.4f} All-Pairs-F1-Score: {:5.4f}." \
+               .format(alt_f1, alt_pairs_f1, repetition,
+                       np.mean(batch_alt_all_f1), np.mean(batch_alt_pairs_all_f1)))

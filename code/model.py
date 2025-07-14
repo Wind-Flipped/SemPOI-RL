@@ -448,6 +448,11 @@ class SPOTModel(nn.Module):
             ),
             IntensityCorrection(0.0000001),
         )
+        
+        # Transformer模块用于替换ODE，进行序列到序列的预测
+        self.seq2seq_transformer = TransformerModel(embed_size=self.hidden_size, nhead=n_head,
+                                                   nhid=2048, nlayers=num_encoder_layers)
+        self.seq_projection = nn.Linear(self.hidden_size, self.hidden_size)
 
         self.transformer_encoder = TransformerModel(embed_size=self.hidden_size * 2, nhead=n_head,
                                                     nhid=2048, nlayers=num_encoder_layers)
@@ -897,45 +902,50 @@ class SPOTModel(nn.Module):
             P_L = generated_embeddings.unsqueeze(1).expand([generated_embeddings.shape[0], d_target_emb.shape[1], generated_embeddings.shape[1]])
 
         if self.args.ode:
-            u_o_emb_d, gamma, tau = self.encoder(o_t, o_l, o_ck, o_pad)
-            z_0 = gamma + tau * torch.randn_like(tau)
-            dynamic_d_emb = self.encoder.time_proj(d_t.to(torch.float32).unsqueeze(-1)) + self.encoder.space_proj(
-                d_l) + self.encoder.poi_emb(d_ck)
-            # dynamic_d_emb = self.encoder.time_proj(d_t.to(torch.float32).unsqueeze(-1)) + self.encoder.poi_emb(d_ck)
-            P_D = []
-            process_loglik = torch.tensor([0.0], device=self.args.device, dtype=torch.float32)
-            obs_loglik = torch.tensor([0.0], device=self.args.device, dtype=torch.float32)
-            for j in range(batch_size):
-                valid_idx = torch.nonzero(d_pad[j], as_tuple=True)[0][:-1]
-                n_pred = len(valid_idx) - 2
-                if target_seq is not None:
-                    gt_times_unif = d_t[j][valid_idx].to(torch.float32)
-                    # print("gt_times_unif:", gt_times_unif)
-                    z_unif_j = odeint(self.dyf, z_0[j].unsqueeze(0), gt_times_unif,
-                                      rtol=self.args.rtol, atol=self.args.atol, method=self.args.solver,
-                                      options={"min_step": 0.0001, "max_step": 100})
-                else:
-                    s_unif = torch.linspace(0, 1, n_pred + 2, device=self.args.device, dtype=torch.float32)
-                    z_unif_j = odeint(self.dyf, z_0[j].unsqueeze(0), s_unif,
-                                      rtol=self.args.rtol, atol=self.args.atol, method=self.args.solver,
-                                      options={"min_step": 0.0001, "max_step": 100})
-                u_hat = z_unif_j.transpose(0, 1).squeeze(0)
-                P_D.append(u_hat)
-                if target_seq is not None:
-                    lm_hat = self.lm(u_hat)
-                    process_loglik += torch.sum(torch.log(lm_hat))
-                    f_values = self.lm(z_unif_j).squeeze(-1).squeeze(-1)
-
-                    integrated_value = torch.trapz(f_values, gt_times_unif)
-
-                    process_loglik -= integrated_value
-
-                    v = dynamic_d_emb[j][valid_idx]
-                    obs_loglik += Normal(u_hat, self.args.sig_v).log_prob(v).sum()
+            # 使用Transformer替换ODE模块进行序列到序列的预测
+            # 构建家乡序列的完整表征
+            o_time_emb = self.encoder.time_proj(o_t.to(torch.float32).unsqueeze(-1))
+            o_space_emb = self.encoder.space_proj(o_l.to(torch.float32))
+            o_poi_emb = self.encoder.poi_emb(o_ck)
+            o_seq_emb = o_time_emb + o_space_emb + o_poi_emb  # [b, o_seq_len, d]
+            
+            # 使用Transformer编码家乡序列
+            # 创建padding mask，True表示需要被忽略的位置
+            o_padding_mask = ~o_pad
+            o_encoded = self.seq2seq_transformer.transformer_encoder(o_seq_emb, src_key_padding_mask=o_padding_mask)
+            
+            # 从编码的家乡序列生成目的地序列表征
+            # 使用平均池化获得家乡的全局表征
+            o_lengths = o_pad.sum(dim=1, keepdim=True).float()  # [b, 1]
+            o_global = (o_encoded * o_pad.unsqueeze(-1)).sum(dim=1) / o_lengths  # [b, d]
+            
+            # 扩展到目的地序列长度
+            d_seq_len = d_ck.size(1)
+            P_D = o_global.unsqueeze(1).expand(-1, d_seq_len, -1)  # [b, d_seq_len, d]
+            P_D = self.seq_projection(P_D)  # 投影到合适的维度
+            
+            # 计算损失函数
             if target_seq is not None:
-                kl_qp = 2 * kl_norm_norm(gamma, torch.zeros_like(gamma), tau, torch.ones_like(tau)).sum()
-                elbo_loss = - (obs_loglik + process_loglik - kl_qp)
-            P_D = self.pad_with_embedding(P_D, pad_vec)
+                # 构建目的地序列的真实表征用于计算损失
+                d_time_emb = self.encoder.time_proj(d_t.to(torch.float32).unsqueeze(-1))
+                d_space_emb = self.encoder.space_proj(d_l.to(torch.float32))
+                d_poi_emb = self.encoder.poi_emb(d_ck)
+                d_target_emb_full = d_time_emb + d_space_emb + d_poi_emb  # [b, d_seq_len, d]
+                
+                # 计算embedding相似度损失（余弦相似度）
+                # 只在有效位置计算损失
+                d_valid_mask = d_pad.unsqueeze(-1)  # [b, d_seq_len, 1]
+                P_D_masked = P_D * d_valid_mask
+                d_target_masked = d_target_emb_full * d_valid_mask
+                
+                # 余弦相似度损失
+                cos_sim = F.cosine_similarity(P_D_masked, d_target_masked, dim=-1)  # [b, d_seq_len]
+                cos_sim_masked = cos_sim * d_pad  # 只在有效位置计算
+                seq2seq_loss = 1 - cos_sim_masked.sum() / d_pad.sum()  # 平均余弦相似度损失
+                
+                # 也可以使用MSE损失作为替代
+                # mse_loss = F.mse_loss(P_D_masked, d_target_masked, reduction='none').mean(dim=-1)
+                # seq2seq_loss = (mse_loss * d_pad).sum() / d_pad.sum()
         if self.args.s_infer:
             u_o_emb_s = self._avg_pooling(o_ck, o_emb)
             infer = self.infer_layer(u_o_emb_s)
@@ -965,7 +975,7 @@ class SPOTModel(nn.Module):
         if target_seq is not None:
             loss = self.criterion(masked_poi_output.view(-1, self.poi_size), d_ck.flatten())
             if self.args.ode:
-                loss += elbo_loss.sum()
+                loss += seq2seq_loss
             if self.args.s_infer:
                 loss += infer_loss
             return loss
