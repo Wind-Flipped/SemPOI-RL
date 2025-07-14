@@ -56,17 +56,21 @@ logger = logging.getLogger(__name__)
 class TravelStyleGenerator:
     """旅游风格生成器 - 封装LLM调用"""
     
-    def __init__(self, model_name: str = "../LLMs/Qwen3-8B", device: str = "cuda", use_vllm= False):
+    def __init__(self, model_name: str = "../LLMs/Qwen3-8B", device: str = "cuda", use_vllm=False, use_lora=False, lora_path: str = "./grpo_travel_style_lora_model/checkpoint-5500"):
         """
         初始化旅游风格生成器
 
         Args:
             model_name: 预训练模型名称
             device: 计算设备
+            use_lora: 是否加载LoRA参数
+            lora_path: LoRA参数路径
         """
         self.device = device
         self.model_name = model_name
         self.use_vllm = use_vllm
+        self.use_lora = use_lora
+        self.lora_path = lora_path
         # 禁用所有日志输出
         logging.getLogger("vllm").setLevel(logging.CRITICAL)
 
@@ -77,13 +81,30 @@ class TravelStyleGenerator:
 
         if use_vllm:
             self.sampling_params = SamplingParams(temperature=0.7, top_p=0.8, top_k=20, max_tokens=512)
-            self.model = LLM(model=model_name, max_model_len=4096, tensor_parallel_size=2)
+            self.model = LLM(model=model_name, max_model_len=2048, tensor_parallel_size=2,
+                             max_num_seqs=4, gpu_memory_utilization=0.8)
+            if use_lora:
+                try:
+                    from peft import PeftModel
+                    self.model = PeftModel.from_pretrained(self.model, lora_path)
+                    logger.info(f"LoRA parameters loaded from {lora_path} and merged with base model.")
+                except Exception as e:
+                    logger.error(f"Failed to load LoRA parameters: {e}")
+                    print(f"Failed to load LoRA parameters: {e}")
         else:
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 device_map="auto",
                 torch_dtype=torch.bfloat16
             )
+            if use_lora:
+                try:
+                    from peft import PeftModel
+                    self.model = PeftModel.from_pretrained(self.model, lora_path)
+                    logger.info(f"LoRA parameters loaded from {lora_path} and merged with base model.")
+                except Exception as e:
+                    logger.error(f"Failed to load LoRA parameters: {e}")
+                    print(f"Failed to load LoRA parameters: {e}")
 
         logger.info(f"Travel style generator initialized with {model_name}")
 
@@ -699,7 +720,7 @@ class TravelStyleGRPOTrainer:
               per_device_train_batch_size: int = 2,
               gradient_accumulation_steps: int = 2,
               num_generations: int = 4,
-              max_prompt_length: int = 3072,
+              max_prompt_length: int = 2048,
               max_completion_length: int = 256,
               save_steps: int = 250,
               logging_steps: int = 1):
@@ -960,7 +981,7 @@ def main():
 
     # 准备训练和测试数据
     from datasets import load_from_disk
-    text_dataset = load_from_disk("../dataset/travel_dataset_20250708_193154")
+    text_dataset = load_from_disk("../dataset/travel_dataset_20250712_201017")
 
     # 训练模型
     trainer.train(

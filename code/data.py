@@ -430,6 +430,12 @@ class TravelTextDataset(Dataset):
         trajectory_data = sorted(trajectory_data, key=lambda x: x['timestamp'])
         
         poi_descriptions = []
+        # 获取时区字符串
+        tz_str = self.city_tz_mapping.get(region_name, "UTC")
+        try:
+            local_tz = pytz.timezone(tz_str)
+        except Exception:
+            local_tz = timezone.utc
         for i, point in enumerate(trajectory_data):
             # 限制最多50个POI
             if i >= 50:
@@ -437,40 +443,30 @@ class TravelTextDataset(Dataset):
             poi_id = point['poi_id']
             category = point['category']
             timestamp = point['timestamp']
-            
             # 获取POI坐标
             poi_num_id = self.poi_idx.get(poi_id, None)
             coord = self.poi_coord.get(poi_num_id, (0.0, 0.0))
             lat, lon = coord
-            
-            # 转换时间戳为UTC时间
+            # 转换时间戳为本地时间
             dt_utc = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-            utc_time_str = dt_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
-            
-            poi_desc = f"POI {i+1}: Category={category}, Location=({lat:.4f}, {lon:.4f}), Time={utc_time_str}"
+            dt_local = dt_utc.astimezone(local_tz)
+            local_time_str = dt_local.strftime("%Y-%m-%d %H:%M:%S %Z")
+            poi_desc = f"POI {i+1}: Category={category}, Time={local_time_str}."
             poi_descriptions.append(poi_desc)
         
         trajectory_text = "\n".join(poi_descriptions)
         
         if query_type == "hometown":
-            prompt = f"""User's travel trajectory in {region_name} (hometown):
+            prompt = f"""As a professional travel analyst and user profiling expert, analyze the user's POI (Point of Interest) trajectory data from their hometown to predict their potential travel style at their destination. Based on their hometown patterns, determine whether they are likely to engage in activities such as cultural exploration, outdoor adventure, historical site visits, shopping, or relaxation. Provide a clear and concise prediction of their travel style without additional details within 200 words.
+User's travel trajectory in {region_name} (hometown):
 {trajectory_text}
-
-Based on this hometown travel pattern, what would be the user's likely travel style when visiting a destination city? Please describe their preferences within 200 words for:
-1. Types of attractions they would visit
-2. Activity patterns and pace
-3. Overall travel behavior
 
 Travel style prediction:"""
         
         else:  # destination
-            prompt = f"""User's actual travel trajectory in {region_name} (destination):
+            prompt = f"""As a professional travel analyst and user profiling expert, analyze the user's POI (Point of Interest) trajectory data at the destination to infer their travel style. Based on this data, predict their primary travel activities, such as cultural exploration, outdoor adventure, historical site visits, shopping, or relaxation. Provide a clear and concise prediction of their travel stylewithout additional details within 200 words, which can be used to further forecast their future POI trajectories at the destination.
+User's actual travel trajectory in {region_name} (destination):
 {trajectory_text}
-
-Based on this actual travel behavior in the destination city, describe the user's travel style within 200 words including:
-1. Types of attractions they prefer
-2. Activity patterns and pace  
-3. Overall travel behavior
 
 Travel style description:"""
         

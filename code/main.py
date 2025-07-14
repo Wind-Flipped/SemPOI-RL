@@ -106,6 +106,9 @@ def main():
     parser.add_argument("--use_target_llm", action="store_true", help="Use target LLM for training")
     parser.add_argument("--use_vllm", action="store_true", help="Use vllm for training")
     parser.add_argument("--llm_embedding_dim", type=int, default=256, help="Embedding dimension for LLM")
+    parser.add_argument("--use_lora", action="store_true", help="Use LLM trained with LoRA for training")
+    parser.add_argument("--lora_path", type=str, default="./grpo_travel_style_lora_model/checkpoint-5500", help="Path to the LoRA model")
+    parser.add_argument("--dataset_path", type=str, default="../dataset/travel_dataset_20250712_201017", help="Path to the dataset for LLM training")
 
     # Parsing command-line arguments
     args = parser.parse_args()

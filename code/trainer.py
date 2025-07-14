@@ -207,9 +207,10 @@ def train_single_phase(model, train_loader, valid_loader, args, logger, kg=None,
     stopping_dict = defaultdict(float)
     flag = True
 
-    from data import create_travel_text_dataset
-    text_dataset = create_travel_text_dataset(args=args, dataset_name=args.dataset_name)
-    prompts, references = text_dataset.get_prompt_reference_pairs()
+    from datasets import load_from_disk
+    text_dataset = load_from_disk(args.dataset_path)
+    prompts, references = [item['prompt'] for item in text_dataset], [item['reference'] for item in text_dataset]
+
     for e in range(args.epoch):
         # pre-training
         if args.kg and args.train_trans and args.model == 'SPOT-Trip':
@@ -395,9 +396,9 @@ def test(model, model_path, test_loader, args, logger, n_region, train_am, train
     # for the repetition
     repetition_list = []
 
-    from data import create_travel_text_dataset
-    text_dataset = create_travel_text_dataset(args=args, dataset_name=args.dataset_name)
-    prompts, references = text_dataset.get_prompt_reference_pairs()
+    from datasets import load_from_disk
+    text_dataset = load_from_disk(args.dataset_path)
+    prompts, references = [item['prompt'] for item in text_dataset], [item['reference'] for item in text_dataset]
 
     for b, (uid, o_ck, d_ck, masked_d_ck, o_h, d_h, masked_d_h, o_t, d_t, o_l, d_l, o_pad, d_pad, o_rg, d_rg) in tqdm(
             enumerate(test_loader), total=len(test_loader.dataset) / args.test_batch):
