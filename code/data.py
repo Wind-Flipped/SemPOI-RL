@@ -531,6 +531,93 @@ Travel style description:"""
         """获取指定索引的文本对"""
         return self.text_pairs[index]
 
+    def get_data(self, trajectory_data, region_name, query_type="hometown"):
+        """
+        格式化轨迹数据为文本描述
+
+        Args:
+            trajectory_data: 轨迹数据列表
+            region_name: 区域名称
+            query_type: 查询类型 ("hometown" 或 "destination")
+
+        Returns:
+            格式化的文本描述
+        """
+        if not trajectory_data:
+            return ""
+
+        # 按时间排序
+        trajectory_data = sorted(trajectory_data, key=lambda x: x['timestamp'])
+
+        poi_descriptions = []
+        # 获取时区字符串
+        tz_str = self.city_tz_mapping.get(region_name, "UTC")
+        try:
+            local_tz = pytz.timezone(tz_str)
+        except Exception:
+            local_tz = timezone.utc
+
+        poi_ids = []
+        categories = []
+        timestamps = []
+
+        for i, point in enumerate(trajectory_data):
+            poi_id = point['poi_id']
+            category = point['category']
+            timestamp = point['timestamp']
+            # 获取POI坐标
+            poi_num_id = self.poi_idx.get(poi_id, None)
+            coord = self.poi_coord.get(poi_num_id, (0.0, 0.0))
+            lat, lon = coord
+            # 转换时间戳为本地时间
+            dt_utc = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+            dt_local = dt_utc.astimezone(local_tz)
+            local_time_str = dt_local.strftime("%Y-%m-%d %H:%M:%S %Z")
+            poi_ids.append(poi_num_id)
+            categories.append(category)
+            timestamps.append(local_time_str)
+
+
+        return poi_ids, categories, timestamps
+
+    def generate_json(self):
+        """生成json数据对"""
+        text_pairs = []
+
+        for uid in self.travel_data:
+            if uid not in self.home_data or uid not in self.oot_data:
+                continue
+
+            ori_region, dst_region = self.travel_data[uid]
+            home_trajectory = self.home_data[uid]
+            oot_trajectory = self.oot_data[uid]
+
+            # 生成hometown prompt (用于训练时的输入)
+            hometown_poi_ids, hometown_categories, hometown_timestamps = self.get_data(
+                home_trajectory, ori_region, "hometown"
+            )
+
+            # 生成destination reference (用于训练时的参考答案)
+            destination_poi_ids, destination_categories, destination_timestamps = self.get_data(
+                oot_trajectory, dst_region, "destination"
+            )
+
+            if hometown_poi_ids and destination_poi_ids:
+                text_pairs.append({
+                    'uid': uid,
+                    'ori_region': ori_region,
+                    'dst_region': dst_region,
+                    'hometown_poi_ids': hometown_poi_ids,
+                    'hometown_categories': hometown_categories,
+                    'hometown_timestamps': hometown_timestamps,
+                    'destination_poi_ids': destination_poi_ids,
+                    'destination_categories': destination_categories,
+                    'destination_timestamps': destination_timestamps
+                })
+
+        return text_pairs
+
+
 def create_travel_text_dataset(args, dataset_name):
     """
     创建旅游文本数据集的便捷函数
@@ -547,3 +634,13 @@ def create_travel_text_dataset(args, dataset_name):
     travel_path = f"../{dataset_name}/travel.txt"
     
     return TravelTextDataset(args, home_path, oot_path, travel_path)
+
+
+if __name__ == '__main__':
+    args = type('', (), {})()  # 创建一个空对象作为args
+    args.dataset_name = 'Yelp'
+
+    travel_dataset = TravelTextDataset(args, f'../{args.dataset_name}/home.txt', f'../{args.dataset_name}/oot.txt', f'../{args.dataset_name}/travel.txt')
+    text_pairs = travel_dataset.generate_json()
+    with open(f'../data/{args.dataset_name}.json', 'w') as f:
+        json.dump(text_pairs, f)

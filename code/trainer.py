@@ -336,11 +336,11 @@ def train_single_phase(model, train_loader, valid_loader, args, logger, kg=None,
                     # # Calculate F1 score and pairs F1 score for the current sample
                     # sample_f1 = metrics.f1_score(sample_target, alt_sample_pred)
                     # sample_pairs_f1 = metrics.pairs_f1_score(sample_target, alt_sample_pred)
-                    full_sample_f1 = metrics.f1_score(torch.cat([torch.tensor([-1]), sample_target, torch.tensor([-2])]),
-                                                      torch.cat([torch.tensor([-1]), sample_pred, torch.tensor([-2])]))
+                    full_sample_f1 = metrics.f1_score(torch.cat([torch.tensor([-1]), sample_target[1:-1], torch.tensor([-2])]),
+                                                      torch.cat([torch.tensor([-1]), sample_pred[1:-1], torch.tensor([-2])]))
                     full_sample_pairs_f1 = metrics.pairs_f1_score(
-                        torch.cat([torch.tensor([-1]), sample_target, torch.tensor([-2])]),
-                        torch.cat([torch.tensor([-1]), sample_pred, torch.tensor([-2])]))
+                        torch.cat([torch.tensor([-1]), sample_target[1:-1], torch.tensor([-2])]),
+                        torch.cat([torch.tensor([-1]), sample_pred[1:-1], torch.tensor([-2])]))
 
                     batch_alt_f1.append(sample_f1)
                     batch_alt_pairs_f1.append(sample_pairs_f1)
@@ -376,7 +376,7 @@ def train_single_phase(model, train_loader, valid_loader, args, logger, kg=None,
 
             logger.log("early stop: {}|{}".format(stopping_dict['f1_epoch'], stopping_dict["pairs_f1_epoch"]))
 
-            if stopping_dict['f1_epoch'] >= args.stop_epoch or stopping_dict['pairs_f1_epoch'] >= args.stop_epoch:
+            if stopping_dict['f1_epoch'] >= args.stop_epoch and stopping_dict['pairs_f1_epoch'] >= args.stop_epoch:
                 flag = False
                 logger.log("early stopped! best epoch: {}".format(stopping_dict['best_epoch']))
 
@@ -471,11 +471,11 @@ def test(model, model_path, test_loader, args, logger, n_region, train_am, train
             # # Calculate F1 score and pairs F1 score for the current sample
             # sample_f1 = metrics.f1_score(sample_target, alt_sample_pred)
             # sample_pairs_f1 = metrics.pairs_f1_score(sample_target, alt_sample_pred)
-            full_sample_f1 = metrics.f1_score(torch.cat([torch.tensor([-1]), sample_target, torch.tensor([-2])]),
-                                              torch.cat([torch.tensor([-1]), sample_pred, torch.tensor([-2])]))
+            full_sample_f1 = metrics.f1_score(torch.cat([torch.tensor([-1]), sample_target[1:-1], torch.tensor([-2])]),
+                                              torch.cat([torch.tensor([-1]), sample_pred[1:-1], torch.tensor([-2])]))
             full_sample_pairs_f1 = metrics.pairs_f1_score(
-                torch.cat([torch.tensor([-1]), sample_target, torch.tensor([-2])]),
-                torch.cat([torch.tensor([-1]), sample_pred, torch.tensor([-2])]))
+                torch.cat([torch.tensor([-1]), sample_target[1:-1], torch.tensor([-2])]),
+                torch.cat([torch.tensor([-1]), sample_pred[1:-1], torch.tensor([-2])]))
 
             batch_alt_f1.append(sample_f1)
             batch_alt_pairs_f1.append(sample_pairs_f1)

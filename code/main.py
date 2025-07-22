@@ -35,8 +35,8 @@ import pickle
 def main():
     parser = argparse.ArgumentParser()
     # Dataset arguments
-    dataset_name = 'Foursquare'
-    parser.add_argument('--dataset_name', type=str, default='Foursquare')
+    dataset_name = 'Foursquare'  # Default dataset name, can be changed to 'Yelp'
+    parser.add_argument('--dataset_name', type=str, default=dataset_name, choices=['Foursquare', 'Yelp'])
     parser.add_argument('--ori_data', type=str, default=f'../{dataset_name}/home.txt')
     parser.add_argument('--dst_data', type=str, default=f'../{dataset_name}/oot.txt')
     parser.add_argument('--trans_data', type=str, default=f'../{dataset_name}/travel.txt')
@@ -67,7 +67,7 @@ def main():
     parser.add_argument('--name', type=str, default="default")
     # parser.add_argument('--model', type=str, default="base")
     parser.add_argument('--device', type=str, default="cuda:0")
-    parser.add_argument("--stop_epoch", type=int, default=8) # early stopping
+    parser.add_argument("--stop_epoch", type=int, default=3) # early stopping
     parser.add_argument("--fine_stop", type=int, default=12)
 
     # Knowledge Graph (KG) Arguments
@@ -109,6 +109,7 @@ def main():
     parser.add_argument("--use_lora", action="store_true", help="Use LLM trained with LoRA for training")
     parser.add_argument("--lora_path", type=str, default="./grpo_travel_style_lora_model/checkpoint-5500", help="Path to the LoRA model")
     parser.add_argument("--dataset_path", type=str, default="../dataset/travel_dataset_20250712_201017", help="Path to the dataset for LLM training")
+    parser.add_argument("--st_module", action="store_true", help="use SpatialTemporal module")
 
     # Parsing command-line arguments
     args = parser.parse_args()
@@ -143,9 +144,10 @@ def main():
 
     n_region = len(data.region_idx)
     max_d_length = max(len(seq) for seq in data.dsts)
+    max_o_length = max(len(seq) for seq in data.oris)
 
     if args.model == 'SPOT-Trip':
-        model = SPOTModel(args, len(data.poi_idx) + 1, data.region_poi, max_d_length,
+        model = SPOTModel(args, len(data.poi_idx) + 1, data.region_poi, max_d_length, max_o_length,
                           d_model=args.hidden_size, n_head=4, num_encoder_layers=1, d_z=args.hidden_size, kg_dataset=kg_data).to(args.device)
         train_am = None
         train_pm = None

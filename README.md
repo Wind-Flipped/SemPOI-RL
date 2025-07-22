@@ -47,3 +47,17 @@ If you want to train the model with RL, you can run the following command:
 cd ./code
 NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python LLMs.py
 ```
+
+## Evaluate with LLM trained with RL
+If you want to evaluate the model with LLM trained with RL, you can run the following command:
+```cmd
+cd ./code
+python main.py --model SPOT-Trip --mode train --train_trans --ode --s_infer --use_llm --use_vllm --use_lora --llm_embedding_dim 256
+```
+
+## Use SpatialTemporal Module for training
+If you want to use the SpatialTemporal module instead of ODE for training, you can run the following command:
+```cmd
+cd ./code
+python main.py --model SPOT-Trip --mode train --train_trans --s_infer --use_llm --use_target_llm --use_vllm --st_module --llm_embedding_dim 256
+```

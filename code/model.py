@@ -17,6 +17,31 @@ from trainer import top_np_recommendation
 from LLMs import TravelStyleGenerator, TravelStyleRewardCalculator
 
 
+class PositionalEncoding(nn.Module):
+    """正弦位置编码，用于给序列添加位置信息"""
+    def __init__(self, d_model, dropout=0.1, max_len=500):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # [1, max_len, d_model] for batch_first=True
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        """
+        Args:
+            x: [batch_size, seq_len, d_model]
+        Returns:
+            x with positional encoding added
+        """
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
+
+
 class Encoder(nn.Module):
     """Encoder mapping context sequences to parameters of the posterior q(z1)."""
 
@@ -400,7 +425,7 @@ class Guiding(nn.Module):
 # Construct total framework(AR-Trip)
 class SPOTModel(nn.Module):
     def __init__(self, args, poi_size, region_poi,
-                 max_length_venue_id=100, d_model=128, n_head=4, num_encoder_layers=1, n_tf_layers=4, d_z=128,
+                 max_length_venue_id=100, max_length_ori_id=100, d_model=128, n_head=4, num_encoder_layers=1, n_tf_layers=4, d_z=128,
                  kg_dataset=None):
 
         super(SPOTModel, self).__init__()
@@ -449,20 +474,42 @@ class SPOTModel(nn.Module):
             IntensityCorrection(0.0000001),
         )
         
-        # Transformer模块用于替换ODE，进行序列到序列的预测
-        self.seq2seq_transformer = TransformerModel(embed_size=self.hidden_size, nhead=n_head,
-                                                   nhid=2048, nlayers=num_encoder_layers)
+        # 使用nn.Transformer进行序列到序列的预测
+        self.seq2seq_transformer = nn.Transformer(
+            d_model=self.hidden_size,
+            nhead=n_head,
+            num_encoder_layers=num_encoder_layers,
+            num_decoder_layers=num_encoder_layers,
+            dim_feedforward=4 * self.hidden_size,
+            dropout=0.1,
+            batch_first=True,
+            norm_first=True  # 使用Pre-LN架构更稳定
+        )
         self.seq_projection = nn.Linear(self.hidden_size, self.hidden_size)
+        self.seq_norm = nn.LayerNorm(self.hidden_size)
+        
+        # 时间和空间的Embedding层用于st_module
+        self.time_embedding = nn.Linear(1, self.hidden_size, bias=False)  # 时间是1维的
+        self.space_embedding = nn.Linear(2, self.hidden_size, bias=False)  # 空间是2维的
+        
+        # 为st_module添加位置编码
+        self.src_pos_encoding = PositionalEncoding(self.hidden_size, dropout=0.1, max_len=max_length_ori_id + 10)
+        self.tgt_pos_encoding = PositionalEncoding(self.hidden_size, dropout=0.1, max_len=max_length_ori_id + 10)
+        
+        # 用于将拼接后的时间+空间+类别信息映射到统一维度
+        self.concat_to_unified = nn.Linear(3 * self.hidden_size, self.hidden_size, bias=False)
 
         self.transformer_encoder = TransformerModel(embed_size=self.hidden_size * 2, nhead=n_head,
-                                                    nhid=2048, nlayers=num_encoder_layers)
+                                                    nhid=self.hidden_size * 8, nlayers=num_encoder_layers)
         self.transformer_encoder2 = TransformerModel(embed_size=self.hidden_size, nhead=n_head,
-                                                    nhid=2048, nlayers=num_encoder_layers)
+                                                    nhid=4 * self.hidden_size, nlayers=num_encoder_layers)
         self.infer_layer = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size),
             nn.SiLU()
         )
-        if self.args.ode and self.args.use_llm:
+        if self.args.st_module and self.args.use_llm:
+            self.predictor = Recommender(self.hidden_size * 2 + self.llm_embedding_dim, poi_size)
+        elif self.args.ode and self.args.use_llm:
             self.predictor = Recommender(self.hidden_size * 2 + self.llm_embedding_dim, poi_size)
         elif self.args.ode and self.args.s_infer:
             self.predictor = Recommender(self.hidden_size * 4, poi_size)
@@ -480,6 +527,12 @@ class SPOTModel(nn.Module):
         self.head_linear = nn.Linear(self.hidden_size, self.hidden_size)
         self.tail_linear = nn.Linear(self.hidden_size, self.hidden_size)
         self.criterion = nn.CrossEntropyLoss(ignore_index=0)  # Ignore padding index during loss calculation
+
+    def generate_square_subsequent_mask(self, sz):
+        """生成causal mask，防止未来位置的信息泄露"""
+        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        return mask
 
     def calc_kg_loss_transE(self, h, r, pos_t, neg_t):
         """
@@ -899,53 +952,161 @@ class SPOTModel(nn.Module):
             generated_embeddings = self.travel_style_reward_calculator.get_embedding(generated_texts,
                                                                                      embedding_dim=self.llm_embedding_dim)
             generated_embeddings = torch.tensor(generated_embeddings).to(self.args.device)  # [b, d]
+            # 对LLM embedding进行L2归一化
+            generated_embeddings = F.normalize(generated_embeddings, p=2, dim=-1)
             P_L = generated_embeddings.unsqueeze(1).expand([generated_embeddings.shape[0], d_target_emb.shape[1], generated_embeddings.shape[1]])
+        
 
-        if self.args.ode:
-            # 使用Transformer替换ODE模块进行序列到序列的预测
-            # 构建家乡序列的完整表征
-            o_time_emb = self.encoder.time_proj(o_t.to(torch.float32).unsqueeze(-1))
-            o_space_emb = self.encoder.space_proj(o_l.to(torch.float32))
-            o_poi_emb = self.encoder.poi_emb(o_ck)
-            o_seq_emb = o_time_emb + o_space_emb + o_poi_emb  # [b, o_seq_len, d]
+        if self.args.st_module:
+            # 初始化损失变量
+            seq2seq_loss = torch.tensor(0.0, device=self.args.device, dtype=torch.float32)
+            # 使用nn.Transformer替换ODE模块进行序列到序列的预测
+            self.args.ode = False
             
-            # 使用Transformer编码家乡序列
-            # 创建padding mask，True表示需要被忽略的位置
-            o_padding_mask = ~o_pad
-            o_encoded = self.seq2seq_transformer.transformer_encoder(o_seq_emb, src_key_padding_mask=o_padding_mask)
+            # 修复维度不匹配问题：去除o_pad和d_pad的最后一个位置
+            o_pad_fixed = o_pad[:, :-1]  # [b, o_seq_len] 去除最后一个位置
+            d_pad_fixed = d_pad[:, :-1]  # [b, d_seq_len] 去除最后一个位置
             
-            # 从编码的家乡序列生成目的地序列表征
-            # 使用平均池化获得家乡的全局表征
-            o_lengths = o_pad.sum(dim=1, keepdim=True).float()  # [b, 1]
-            o_global = (o_encoded * o_pad.unsqueeze(-1)).sum(dim=1) / o_lengths  # [b, d]
+            # 构建源序列（家乡序列）的完整表征，使用知识图谱的POI embedding
+            o_time_emb = self.time_embedding(o_t.to(torch.float32).unsqueeze(-1))  # [b, o_seq_len, d]
+            o_space_emb = self.space_embedding(o_l.to(torch.float32))  # [b, o_seq_len, d]
+            # 将时间、空间、类别信息拼接后映射到统一维度
+            o_concat_emb = torch.cat([o_time_emb, o_space_emb, o_emb], dim=-1)  # [b, o_seq_len, 3*d]
+            o_src_seq_base = self.concat_to_unified(o_concat_emb)  # [b, o_seq_len, d] 映射到统一维度
             
-            # 扩展到目的地序列长度
-            d_seq_len = d_ck.size(1)
-            P_D = o_global.unsqueeze(1).expand(-1, d_seq_len, -1)  # [b, d_seq_len, d]
-            P_D = self.seq_projection(P_D)  # 投影到合适的维度
+            # 提取query_emb的起点和终点信息并拼接到源序列后面
+            batch_size = query_emb.shape[0]
+            query_start_end_list = []
+            
+            for i in range(batch_size):
+                # 找到当前样本在目的地序列中的有效长度
+                valid_d_positions = torch.nonzero(d_pad_fixed[i], as_tuple=True)[0]
+                if len(valid_d_positions) > 0:
+                    start_pos = valid_d_positions[0].item()  # 起点位置
+                    end_pos = valid_d_positions[-1].item()  # 终点位置
+                    start_emb = query_emb[i, start_pos, :]   # 起点embedding
+                    end_emb = query_emb[i, end_pos, :]       # 终点embedding
+                else:
+                    # 如果没有有效位置，使用零向量
+                    start_emb = torch.zeros_like(query_emb[i, 0, :])
+                    end_emb = torch.zeros_like(query_emb[i, 0, :])
+                
+                query_start_end_list.append(torch.stack([start_emb, end_emb], dim=0))  # [2, d]
+            
+            # 将列表转换为tensor [b, 2, d]
+            query_start_end = torch.stack(query_start_end_list, dim=0)
+            
+            # 将query的起点和终点信息拼接到源序列后面
+            o_src_seq = torch.cat([o_src_seq_base, query_start_end], dim=1)  # [b, o_seq_len + 2, d]
+            
+            # 构建目标序列（目的地序列），只使用时间信息
+            d_time_emb = self.time_embedding(d_t.to(torch.float32).unsqueeze(-1))  # [b, d_seq_len, d]
+            d_space_emb = self.space_embedding(d_l.to(torch.float32))  # [b, d_seq_len, d]
+            query_enhanced_d_seq = d_time_emb
+            # 将时间、空间、类别信息拼接后映射到统一维度
+            # d_concat_emb = torch.cat([d_time_emb, d_space_emb, d_target_emb], dim=-1)  # [b, d_seq_len, 3*d]
+            # query_enhanced_d_seq = self.concat_to_unified(d_concat_emb)  # [b, d_seq_len, d] 映射到统一维度
+            
+            # 添加位置编码到源序列和目标序列
+            o_src_seq = self.src_pos_encoding(o_src_seq)  # [b, o_seq_len + 2, d] 添加源序列位置编码
+            query_enhanced_d_seq = self.tgt_pos_encoding(query_enhanced_d_seq)  # [b, d_seq_len, d] 添加目标序列位置编码
+            
+            # 创建attention mask
+            # 源序列padding mask：True表示需要被忽略的位置
+            # 扩展源序列的padding mask以包含query部分（query部分总是有效的）
+            query_pad = torch.ones(o_pad_fixed.shape[0], 2, dtype=torch.bool, device=o_pad_fixed.device)  # [b, 2]
+            o_pad_extended = torch.cat([o_pad_fixed[:, :o_src_seq_base.shape[1]], query_pad], dim=1)  # [b, o_seq_len+2]
+            src_key_padding_mask = ~o_pad_extended  # [b, o_seq_len+2]
+            # 目标序列padding mask
+            tgt_key_padding_mask = ~d_pad_fixed[:, :query_enhanced_d_seq.shape[1]]  # [b, d_seq_len]
+            
+            # 生成causal mask防止未来信息泄露
+            d_seq_len = query_enhanced_d_seq.shape[1]
+            tgt_mask = self.generate_square_subsequent_mask(d_seq_len).to(query_enhanced_d_seq.device)
+            
+            # 使用nn.Transformer进行序列到序列的转换
+            P_D = self.seq2seq_transformer(
+                src=o_src_seq,  # 源序列（家乡序列）
+                tgt=query_enhanced_d_seq,  # 目标序列（目的地序列+query信息）
+                tgt_mask=tgt_mask,  # causal mask
+                src_key_padding_mask=src_key_padding_mask,  # 源序列padding mask
+                tgt_key_padding_mask=tgt_key_padding_mask  # 目标序列padding mask
+            )
+            
+            # 应用目的地序列的padding mask来屏蔽无效位置的输出
+            P_D = P_D * d_pad_fixed[:, :query_enhanced_d_seq.shape[1]].unsqueeze(-1)  # 将无效位置置零
+            
+            # 应用最终的投影层和归一化
+            # P_D = self.seq_projection(P_D)  # 投影到合适的维度
+            # P_D = self.seq_norm(P_D)  # 层归一化
             
             # 计算损失函数
             if target_seq is not None:
-                # 构建目的地序列的真实表征用于计算损失
-                d_time_emb = self.encoder.time_proj(d_t.to(torch.float32).unsqueeze(-1))
-                d_space_emb = self.encoder.space_proj(d_l.to(torch.float32))
-                d_poi_emb = self.encoder.poi_emb(d_ck)
-                d_target_emb_full = d_time_emb + d_space_emb + d_poi_emb  # [b, d_seq_len, d]
+                # 构建目的地序列的真实表征用于计算损失，使用相同的拼接映射方式
+                d_target_concat = torch.cat([d_time_emb, d_space_emb, d_target_emb], dim=-1)  # [b, d_seq_len, 3*d]
+                d_target_emb_full = self.concat_to_unified(d_target_concat)  # [b, d_seq_len, d] 映射到统一维度
                 
-                # 计算embedding相似度损失（余弦相似度）
+                # 计算embedding的L2距离损失
+                # 确保P_D和d_target_emb_full的序列长度一致
+                min_seq_len = min(P_D.shape[1], d_target_emb_full.shape[1])
+                P_D_truncated = P_D[:, :min_seq_len, :]
+                d_target_truncated = d_target_emb_full[:, :min_seq_len, :]
+                d_pad_truncated = d_pad_fixed[:, :min_seq_len]
+                
                 # 只在有效位置计算损失
-                d_valid_mask = d_pad.unsqueeze(-1)  # [b, d_seq_len, 1]
-                P_D_masked = P_D * d_valid_mask
-                d_target_masked = d_target_emb_full * d_valid_mask
+                d_valid_mask = d_pad_truncated.unsqueeze(-1)  # [b, min_seq_len, 1]
+                P_D_masked = P_D_truncated * d_valid_mask
+                d_target_masked = d_target_truncated * d_valid_mask
                 
-                # 余弦相似度损失
-                cos_sim = F.cosine_similarity(P_D_masked, d_target_masked, dim=-1)  # [b, d_seq_len]
-                cos_sim_masked = cos_sim * d_pad  # 只在有效位置计算
-                seq2seq_loss = 1 - cos_sim_masked.sum() / d_pad.sum()  # 平均余弦相似度损失
-                
-                # 也可以使用MSE损失作为替代
-                # mse_loss = F.mse_loss(P_D_masked, d_target_masked, reduction='none').mean(dim=-1)
-                # seq2seq_loss = (mse_loss * d_pad).sum() / d_pad.sum()
+                # L2距离损失（MSE损失）
+                mse_loss = F.mse_loss(P_D_masked, d_target_masked, reduction='none').mean(dim=-1)  # [b, min_seq_len]
+                mse_loss_masked = mse_loss * d_pad_truncated  # 只在有效位置计算
+                if d_pad_truncated.sum() > 0:  # 避免除零错误
+                    seq2seq_loss = mse_loss_masked.sum() / d_pad_truncated.sum()  # 平均L2距离损失
+                else:
+                    seq2seq_loss = torch.tensor(0.0, device=self.args.device, dtype=torch.float32)
+
+        if self.args.ode:
+            u_o_emb_d, gamma, tau = self.encoder(o_t, o_l, o_ck, o_pad)
+            z_0 = gamma + tau * torch.randn_like(tau)
+            dynamic_d_emb = self.encoder.time_proj(d_t.to(torch.float32).unsqueeze(-1)) + self.encoder.space_proj(
+                d_l) + self.encoder.poi_emb(d_ck)
+            # dynamic_d_emb = self.encoder.time_proj(d_t.to(torch.float32).unsqueeze(-1)) + self.encoder.poi_emb(d_ck)
+            P_D = []
+            process_loglik = torch.tensor([0.0], device=self.args.device, dtype=torch.float32)
+            obs_loglik = torch.tensor([0.0], device=self.args.device, dtype=torch.float32)
+            for j in range(batch_size):
+                valid_idx = torch.nonzero(d_pad[j], as_tuple=True)[0][:-1]
+                n_pred = len(valid_idx) - 2
+                if target_seq is not None:
+                    gt_times_unif = d_t[j][valid_idx].to(torch.float32)
+                    # print("gt_times_unif:", gt_times_unif)
+                    z_unif_j = odeint(self.dyf, z_0[j].unsqueeze(0), gt_times_unif,
+                                      rtol=self.args.rtol, atol=self.args.atol, method=self.args.solver,
+                                      options={"min_step": 0.0001, "max_step": 100})
+                else:
+                    s_unif = torch.linspace(0, 1, n_pred + 2, device=self.args.device, dtype=torch.float32)
+                    z_unif_j = odeint(self.dyf, z_0[j].unsqueeze(0), s_unif,
+                                      rtol=self.args.rtol, atol=self.args.atol, method=self.args.solver,
+                                      options={"min_step": 0.0001, "max_step": 100})
+                u_hat = z_unif_j.transpose(0, 1).squeeze(0)
+                P_D.append(u_hat)
+                if target_seq is not None:
+                    lm_hat = self.lm(u_hat)
+                    process_loglik += torch.sum(torch.log(lm_hat))
+                    f_values = self.lm(z_unif_j).squeeze(-1).squeeze(-1)
+
+                    integrated_value = torch.trapz(f_values, gt_times_unif)
+
+                    process_loglik -= integrated_value
+
+                    v = dynamic_d_emb[j][valid_idx]
+                    obs_loglik += Normal(u_hat, self.args.sig_v).log_prob(v).sum()
+            if target_seq is not None:
+                kl_qp = 2 * kl_norm_norm(gamma, torch.zeros_like(gamma), tau, torch.ones_like(tau)).sum()
+                elbo_loss = - (obs_loglik + process_loglik - kl_qp)
+            P_D = self.pad_with_embedding(P_D, pad_vec)
+
         if self.args.s_infer:
             u_o_emb_s = self._avg_pooling(o_ck, o_emb)
             infer = self.infer_layer(u_o_emb_s)
@@ -961,7 +1122,11 @@ class SPOTModel(nn.Module):
         else:
             model_input = torch.cat([query_emb, position_embedded], dim=2)
             encoder_output = self.transformer_encoder(model_input)
+        # model_input = torch.cat([query_emb, position_embedded], dim=2)
+        # encoder_output = self.transformer_encoder(model_input)
 
+        if self.args.st_module and self.args.use_llm:
+            encoder_output = torch.cat([encoder_output, P_D, P_L], dim=2)
         if self.args.ode and self.args.use_llm:
             encoder_output = torch.cat([encoder_output, P_D, P_L], dim=2)
         elif self.args.ode and self.args.s_infer:
@@ -975,6 +1140,8 @@ class SPOTModel(nn.Module):
         if target_seq is not None:
             loss = self.criterion(masked_poi_output.view(-1, self.poi_size), d_ck.flatten())
             if self.args.ode:
+                loss += elbo_loss.sum()
+            if self.args.st_module:
                 loss += seq2seq_loss
             if self.args.s_infer:
                 loss += infer_loss
