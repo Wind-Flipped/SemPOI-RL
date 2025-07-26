@@ -195,7 +195,7 @@ def ad_top_np_recommendation(batch_candidate, batch_similarity, confidence, thre
     return top_candidates
 
 
-def train_single_phase(model, train_loader, valid_loader, args, logger, kg=None, train_am=None, train_pm=None):
+def train_single_phase(model, train_loader, valid_loader, test_loader, args, logger, kg=None, train_am=None, train_pm=None):
     """
     Train the model for a single phase.
     Returns:
@@ -354,12 +354,14 @@ def train_single_phase(model, train_loader, valid_loader, args, logger, kg=None,
             logger.log("[val] Epoch {}/{} F1-Score: {:5.4f} Pairs-F1-Score: {:5.4f}. All-F1-Score: {:5.4f} All-Pairs-F1-Score: {:5.4f}." \
                        .format(e, args.epoch - 1, alt_f1, alt_pairs_f1, alt_all_f1, alt_pairs_all_f1))
 
+        get_test_result(model, test_loader, args, logger, prompts, references)
+
         # early stop
         if flag:
             if alt_f1 > stopping_dict['best_f1']:
                 stopping_dict['best_f1'] = alt_f1
                 stopping_dict['f1_epoch'] = 0
-                # stopping_dict['best_epoch'] = e
+                stopping_dict['best_epoch'] = e
                 # if args.best_save:
                 #     save_model(model, "best", args.save_path, optimizer, scheduler)
             else:
@@ -388,6 +390,84 @@ def train_single_phase(model, train_loader, valid_loader, args, logger, kg=None,
             else:
                 return best_return
 
+def get_test_result(model, test_loader, args, logger, prompts, references):
+    batch_alt_f1 = []
+    batch_alt_pairs_f1 = []
+    batch_alt_all_f1 = []
+    batch_alt_pairs_all_f1 = []
+    # for the repetition
+    repetition_list = []
+    for b, (uid, o_ck, d_ck, masked_d_ck, o_h, d_h, masked_d_h, o_t, d_t, o_l, d_l, o_pad, d_pad, o_rg, d_rg) in tqdm(
+            enumerate(test_loader), total=len(test_loader.dataset) / args.test_batch):
+        if args.use_target_llm:
+            # 提取uid对应的references，uid是tensor，需要转换为Python列表来索引prompts
+            batch_messages = [references[uid_item.item()] for uid_item in uid]
+        else:
+            # 提取uid对应的messages，uid是tensor，需要转换为Python列表来索引prompts
+            batch_messages = [prompts[uid_item.item()] for uid_item in uid]
+        messages = batch_messages  # 暂时保持为列表格式，具体tokenization在模型内部处理
+        uid = uid.to(args.device)
+        o_ck = o_ck.to(args.device)
+        masked_d_ck = masked_d_ck.to(args.device)
+        d_ck = d_ck.to(args.device)
+        o_h = o_h.to(args.device)
+        masked_d_h = masked_d_h.to(args.device)
+        d_h = d_h.to(args.device)
+        o_t = o_t.to(args.device)
+        d_t = d_t.to(args.device)
+        o_l = o_l.to(args.device)
+        d_l = d_l.to(args.device)
+        o_pad = o_pad.to(args.device)
+        d_pad = d_pad.to(args.device)
+        o_rg = o_rg.to(args.device)
+        d_rg = d_rg.to(args.device)
+        if args.model == 'SPOT-Trip':
+            predicted_ids = model(messages, o_ck, masked_d_ck, o_t, d_t, o_l, d_l, o_pad, d_pad, d_ck, o_rg, d_rg,
+                                  target_seq=None)
+        # Process each sample in the batch separately
+        for i in range(predicted_ids.shape[0]):
+            # Extract the prediction and target for the current sample
+            sample_pred = predicted_ids[i].cpu()  # shape: [seq_len]
+            sample_target = d_ck[i].cpu()  # shape: [seq_len]
+
+            # Exclude padded values (assuming padding is represented by 0)
+            non_padded_indices = sample_target != 0
+            sample_pred = sample_pred[non_padded_indices]
+            sample_target = sample_target[non_padded_indices]
+
+            # If the sample length is greater than 1, perform alteration to keep the first and last elements unchanged
+            if sample_target.numel() > 1:
+                alt_sample_pred = torch.cat((sample_target[:1], sample_pred[1:-1], sample_target[-1:]),
+                                            dim=0)
+            else:
+                alt_sample_pred = sample_pred
+
+            # Calculate F1 score and pairs F1 score for the current sample
+            sample_f1 = metrics.f1_score(sample_target[1:-1], sample_pred[1:-1])
+            sample_pairs_f1 = metrics.pairs_f1_score(sample_target[1:-1], sample_pred[1:-1])
+            # # Calculate F1 score and pairs F1 score for the current sample
+            # sample_f1 = metrics.f1_score(sample_target, alt_sample_pred)
+            # sample_pairs_f1 = metrics.pairs_f1_score(sample_target, alt_sample_pred)
+            full_sample_f1 = metrics.f1_score(torch.cat([torch.tensor([-1]), sample_target[1:-1], torch.tensor([-2])]),
+                                              torch.cat([torch.tensor([-1]), sample_pred[1:-1], torch.tensor([-2])]))
+            full_sample_pairs_f1 = metrics.pairs_f1_score(
+                torch.cat([torch.tensor([-1]), sample_target[1:-1], torch.tensor([-2])]),
+                torch.cat([torch.tensor([-1]), sample_pred[1:-1], torch.tensor([-2])]))
+
+            batch_alt_f1.append(sample_f1)
+            batch_alt_pairs_f1.append(sample_pairs_f1)
+            batch_alt_all_f1.append(full_sample_f1)
+            batch_alt_pairs_all_f1.append(full_sample_pairs_f1)
+
+            repetition_ratio = metrics.count_adjacent_repetition_rate(alt_sample_pred)
+            repetition_list.append(repetition_ratio)
+            # torch.cuda.empty_cache()
+    repetition = np.mean(repetition_list)
+    alt_f1 = np.mean(batch_alt_f1)
+    alt_pairs_f1 = np.mean(batch_alt_pairs_f1)
+    logger.log("[test-general] F1-Score: {:5.4f} Pairs-F1-Score: {:5.4f} Repetition: {:5.4f}. All-F1-Score: {:5.4f} All-Pairs-F1-Score: {:5.4f}." \
+               .format(alt_f1, alt_pairs_f1, repetition,
+                       np.mean(batch_alt_all_f1), np.mean(batch_alt_pairs_all_f1)))
 
 def test(model, model_path, test_loader, args, logger, n_region, train_am, train_pm):
     """

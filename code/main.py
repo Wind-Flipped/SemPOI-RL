@@ -35,7 +35,7 @@ import pickle
 def main():
     parser = argparse.ArgumentParser()
     # Dataset arguments
-    dataset_name = 'Foursquare'  # Default dataset name, can be changed to 'Yelp'
+    dataset_name = 'Yelp'  # Default dataset name, can be changed to 'Yelp'
     parser.add_argument('--dataset_name', type=str, default=dataset_name, choices=['Foursquare', 'Yelp'])
     parser.add_argument('--ori_data', type=str, default=f'../{dataset_name}/home.txt')
     parser.add_argument('--dst_data', type=str, default=f'../{dataset_name}/oot.txt')
@@ -108,11 +108,26 @@ def main():
     parser.add_argument("--llm_embedding_dim", type=int, default=256, help="Embedding dimension for LLM")
     parser.add_argument("--use_lora", action="store_true", help="Use LLM trained with LoRA for training")
     parser.add_argument("--lora_path", type=str, default="./grpo_travel_style_lora_model/checkpoint-5500", help="Path to the LoRA model")
-    parser.add_argument("--dataset_path", type=str, default="../dataset/travel_dataset_20250712_201017", help="Path to the dataset for LLM training")
+    parser.add_argument("--dataset_path", type=str, default="../dataset/Yelp_20250714_192438", help="Path to the dataset for LLM training")
     parser.add_argument("--st_module", action="store_true", help="use SpatialTemporal module")
+    # Semantic Masking parameters
+    parser.add_argument("--num_semantic_parts", type=int, default=0, help="Number of semantic parts for semantic-aware masking in MAE. Set to 0 to disable semantic masking and use random masking only.")
 
+    # Yelp: ../dataset/Yelp_20250714_192438
+    # Foursquare: ../dataset/travel_dataset_20250712_201017
     # Parsing command-line arguments
     args = parser.parse_args()
+    args.ori_data = f'../{args.dataset_name}/home.txt'
+    args.dst_data = f'../{args.dataset_name}/oot.txt'
+    args.trans_data = f'../{args.dataset_name}/travel.txt'
+    args.kg_path = f'../{args.dataset_name}/kg.txt'
+    args.test_path = f'../{args.dataset_name}/test.txt'
+    args.data_split_path = f'../{args.dataset_name}/data_split.pkl'
+    args.save_path = f'../{args.dataset_name}/model_save'
+    if args.dataset_name == 'Foursquare':
+        args.dataset_path = '../dataset/travel_dataset_20250712_201017'
+    elif args.dataset_name == 'Yelp':
+        args.dataset_path = '../dataset/Yelp_20250714_192438'
     set_seeds(args.seed)
     args.save_path = os.path.join(args.save_path, args.name)
     path_exist(args.save_path)
@@ -163,9 +178,9 @@ def main():
                          max_d_length, d_model=args.hidden_size, n_head=4, num_encoder_layers=1).to(args.device)
 
     if args.mode == 'train':
-        best = train_single_phase(model, train_loader, valid_loader, args, logger, kg_data, train_am, train_pm)
+        best = train_single_phase(model, train_loader, valid_loader, test_loader, args, logger, kg_data, train_am, train_pm)
 
-        test(model, os.path.join(args.save_path, "model_{}.xhr".format(best)), test_loader, args, logger, n_region, train_am, train_pm)
+        # test(model, os.path.join(args.save_path, "model_{}.xhr".format(best)), test_loader, args, logger, n_region, train_am, train_pm)
         print("################## current exp done ##################")
     elif args.mode == 'test':
         test(model, os.path.join(args.save_path, "model_best.xhr"), test_loader, args, logger, n_region, train_am, train_pm)

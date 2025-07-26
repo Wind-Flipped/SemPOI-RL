@@ -1,3 +1,4 @@
+from ast import arg
 import math
 import torch
 import torch.nn as nn
@@ -16,6 +17,7 @@ from trainer import top_np_recommendation
 
 from LLMs import TravelStyleGenerator, TravelStyleRewardCalculator
 import numpy as np
+from mae import MaskedAutoEncoder
 
 class PositionalEncoding(nn.Module):
     """正弦位置编码，用于给序列添加位置信息"""
@@ -40,469 +42,6 @@ class PositionalEncoding(nn.Module):
         """
         x = x + self.pe[:, :x.size(1), :]
         return self.dropout(x)
-
-class MaskedAutoEncoder(nn.Module):
-    """ Masked Autoencoder for Sequence Data
-    """
-    
-    def __init__(self, seq_len=100, embed_dim=128, depth=6, num_heads=8,
-                 decoder_embed_dim=128, decoder_depth=4, decoder_num_heads=8,
-                 mlp_ratio=4., norm_layer=nn.LayerNorm):
-        super().__init__()
-        
-        self.seq_len = seq_len
-        self.embed_dim = embed_dim
-        
-        # --------------------------------------------------------------------------
-        # MAE encoder specifics
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, seq_len + 1, embed_dim), requires_grad=False)  # fixed sin-cos embedding, +1 for cls token
-        
-        self.encoder_blocks = nn.ModuleList([
-            nn.TransformerEncoderLayer(
-                d_model=embed_dim,
-                nhead=num_heads,
-                dim_feedforward=int(embed_dim * mlp_ratio),
-                dropout=0.1,
-                batch_first=True,
-                norm_first=True
-            ) for _ in range(depth)
-        ])
-        self.encoder_norm = norm_layer(embed_dim)
-        # --------------------------------------------------------------------------
-        
-        # --------------------------------------------------------------------------
-        # MAE decoder specifics
-        self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim, bias=True)
-        
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
-        
-        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, seq_len + 1, decoder_embed_dim), requires_grad=False)  # fixed sin-cos embedding, +1 for cls token
-        
-        self.decoder_blocks = nn.ModuleList([
-            nn.TransformerEncoderLayer(  # 使用Encoder作为Decoder
-                d_model=decoder_embed_dim,
-                nhead=decoder_num_heads,
-                dim_feedforward=int(decoder_embed_dim * mlp_ratio),
-                dropout=0.1,
-                batch_first=True,
-                norm_first=True
-            ) for _ in range(decoder_depth)
-        ])
-        
-        self.decoder_norm = norm_layer(decoder_embed_dim)
-        self.decoder_pred = nn.Linear(decoder_embed_dim, embed_dim, bias=True)  # decoder to original embedding
-        # --------------------------------------------------------------------------
-        
-        self.initialize_weights()
-    
-    def initialize_weights(self):
-        # initialize position embeddings with sin-cos embedding
-        pos_embed = self.get_1d_sincos_pos_embed(self.embed_dim, self.seq_len, cls_token=True)
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
-        
-        decoder_pos_embed = self.get_1d_sincos_pos_embed(self.decoder_embed.out_features, self.seq_len, cls_token=True)
-        self.decoder_pos_embed.data.copy_(torch.from_numpy(decoder_pos_embed).float().unsqueeze(0))
-        
-        # initialize cls token
-        torch.nn.init.normal_(self.cls_token, std=.02)
-        
-        # initialize mask token
-        torch.nn.init.normal_(self.mask_token, std=.02)
-        
-        # initialize nn.Linear and nn.LayerNorm
-        self.apply(self._init_weights)
-    
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            torch.nn.init.xavier_uniform_(m.weight)
-            if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-    
-    def get_1d_sincos_pos_embed(self, embed_dim, seq_len, cls_token=False, temperature=10000.):
-        """
-        Create 1D sin-cos positional embeddings for sequences
-        """
-        position = np.arange(seq_len)[:, np.newaxis]
-        div_term = np.exp(np.arange(0, embed_dim, 2) * -(np.log(temperature) / embed_dim))
-        
-        pos_embed = np.zeros((seq_len, embed_dim))
-        pos_embed[:, 0::2] = np.sin(position * div_term)
-        pos_embed[:, 1::2] = np.cos(position * div_term)
-        
-        if cls_token:
-            cls_pos_embed = np.zeros((1, embed_dim))
-            pos_embed = np.concatenate([cls_pos_embed, pos_embed], axis=0)
-        
-        return pos_embed
-    
-    def random_masking(self, x, mask_ratio, hometown_len_list=None, destination_start_list=None, destination_end_list=None, valid_mask=None):
-        """
-        Perform per-sample random masking by per-sample shuffling for destination sequences.
-        x: [N, L, D], sequence (hometown + destination concatenated)
-        hometown_len_list: list of int, length of hometown sequence for each sample
-        destination_start_list: list of int, start position of destination sequence in concatenated sequence
-        destination_end_list: list of int, end position of destination sequence in concatenated sequence
-        valid_mask: [N, L], True for valid positions, False for padding
-        """
-        N, L, D = x.shape  # batch, length, dim
-        
-        if valid_mask is None:
-            valid_mask = torch.ones(N, L, dtype=torch.bool, device=x.device)
-        
-        # Create final masks for each sample
-        final_masks = []
-        ids_keep_list = []
-        ids_restore_list = []
-        x_masked_list = []
-        
-        for i in range(N):
-            # Get destination sequence range for this sample
-            if (hometown_len_list is not None and destination_start_list is not None and 
-                destination_end_list is not None):
-                dest_start = destination_start_list[i]
-                dest_end = destination_end_list[i]
-                
-                # Create mask - only mask destination sequence (excluding start and end)
-                mask = torch.zeros(L, dtype=torch.bool, device=x.device)
-                
-                if dest_end > dest_start + 1:  # At least one position between start and end
-                    # Maskable positions: middle positions of destination sequence
-                    maskable_positions = torch.arange(dest_start + 1, dest_end, device=x.device)
-                    
-                    # Filter by valid mask
-                    maskable_positions = maskable_positions[valid_mask[i, maskable_positions]]
-                    
-                    if len(maskable_positions) > 0:
-                        num_mask = int(len(maskable_positions) * mask_ratio)
-                        if num_mask > 0:
-                            # Random masking
-                            noise = torch.rand(len(maskable_positions), device=x.device)
-                            ids_shuffle = torch.argsort(noise)
-                            
-                            # Positions to mask
-                            mask_indices = maskable_positions[ids_shuffle[:num_mask]]
-                            mask[mask_indices] = True
-                
-                # Keep unmasked positions
-                keep_indices = torch.nonzero(~mask, as_tuple=True)[0]
-                ids_keep = keep_indices
-            else:
-                # Fallback to original logic if destination positions not provided
-                valid_positions = torch.nonzero(valid_mask[i], as_tuple=True)[0]
-                
-                if len(valid_positions) == 0:
-                    ids_keep = torch.arange(L, device=x.device)
-                    mask = torch.zeros(L, dtype=torch.bool, device=x.device)
-                else:
-                    # Preserve first and last valid positions
-                    if len(valid_positions) > 2:
-                        start_pos = valid_positions[0]
-                        end_pos = valid_positions[-1]
-                        maskable_positions = valid_positions[1:-1]
-                        
-                        num_mask = int(len(maskable_positions) * mask_ratio)
-                        mask = torch.zeros(L, dtype=torch.bool, device=x.device)
-                        
-                        if num_mask > 0:
-                            noise = torch.rand(len(maskable_positions), device=x.device)
-                            ids_shuffle = torch.argsort(noise)
-                            mask_indices = maskable_positions[ids_shuffle[:num_mask]]
-                            mask[mask_indices] = True
-                    else:
-                        mask = torch.zeros(L, dtype=torch.bool, device=x.device)
-                    
-                    keep_indices = torch.nonzero(~mask, as_tuple=True)[0]
-                    ids_keep = keep_indices
-            
-            # Create restore indices (argsort of keep indices)
-            ids_restore = torch.argsort(ids_keep)
-            
-            # Extract kept tokens
-            x_masked = x[i, ids_keep, :]
-            
-            final_masks.append(mask)
-            ids_keep_list.append(ids_keep)
-            ids_restore_list.append(ids_restore)
-            x_masked_list.append(x_masked)
-        
-        # Pad x_masked to same length for batch processing
-        max_keep = max(x_m.shape[0] for x_m in x_masked_list)
-        x_masked_padded = torch.zeros(N, max_keep, D, device=x.device)
-        keep_mask = torch.zeros(N, max_keep, dtype=torch.bool, device=x.device)
-        
-        for i, x_m in enumerate(x_masked_list):
-            length = x_m.shape[0]
-            x_masked_padded[i, :length] = x_m
-            keep_mask[i, :length] = True
-        
-        # Stack masks
-        mask = torch.stack(final_masks, dim=0)  # [N, L]
-        
-        return x_masked_padded, mask, ids_keep_list, ids_restore_list, keep_mask
-    
-    def fixed_masking(self, x, hometown_len_list=None, destination_start_list=None, destination_end_list=None, valid_mask=None):
-        """
-        Fixed masking for inference: mask all destination positions except start and end
-        x: [N, L, D], sequence (hometown + destination concatenated)
-        hometown_len_list: list of int, length of hometown sequence for each sample
-        destination_start_list: list of int, start position of destination sequence in concatenated sequence
-        destination_end_list: list of int, end position of destination sequence in concatenated sequence
-        valid_mask: [N, L], True for valid positions, False for padding
-        """
-        N, L, D = x.shape
-        
-        if valid_mask is None:
-            valid_mask = torch.ones(N, L, dtype=torch.bool, device=x.device)
-        
-        final_masks = []
-        ids_keep_list = []
-        ids_restore_list = []
-        x_masked_list = []
-        
-        for i in range(N):
-            # Get destination sequence range for this sample
-            if (hometown_len_list is not None and destination_start_list is not None and 
-                destination_end_list is not None):
-                dest_start = destination_start_list[i]
-                dest_end = destination_end_list[i]
-                
-                # Create mask - mask all destination sequence except start and end
-                mask = torch.zeros(L, dtype=torch.bool, device=x.device)
-                
-                if dest_end > dest_start + 1:  # At least one position between start and end
-                    # Mask all middle positions of destination sequence
-                    middle_positions = torch.arange(dest_start + 1, dest_end, device=x.device)
-                    
-                    # Filter by valid mask
-                    middle_positions = middle_positions[valid_mask[i, middle_positions]]
-                    mask[middle_positions] = True
-                
-                # Keep unmasked positions
-                keep_indices = torch.nonzero(~mask, as_tuple=True)[0]
-                ids_keep = keep_indices
-            else:
-                # Fallback to original logic if destination positions not provided
-                valid_positions = torch.nonzero(valid_mask[i], as_tuple=True)[0]
-                
-                if len(valid_positions) == 0:
-                    ids_keep = torch.arange(L, device=x.device)
-                    mask = torch.zeros(L, dtype=torch.bool, device=x.device)
-                else:
-                    # Mask all middle valid positions, keep start and end
-                    mask = torch.zeros(L, dtype=torch.bool, device=x.device)
-                    if len(valid_positions) > 2:
-                        start_pos = valid_positions[0]
-                        end_pos = valid_positions[-1]
-                        middle_positions = valid_positions[1:-1]
-                        mask[middle_positions] = True
-                    
-                    keep_indices = torch.nonzero(~mask, as_tuple=True)[0]
-                    ids_keep = keep_indices
-            
-            # Create restore indices
-            ids_restore = torch.argsort(ids_keep)
-            
-            # Extract kept tokens
-            x_masked = x[i, ids_keep, :]
-            
-            final_masks.append(mask)
-            ids_keep_list.append(ids_keep)
-            ids_restore_list.append(ids_restore)
-            x_masked_list.append(x_masked)
-        
-        # Pad x_masked to same length for batch processing
-        max_keep = max(x_m.shape[0] for x_m in x_masked_list)
-        x_masked_padded = torch.zeros(N, max_keep, D, device=x.device)
-        keep_mask = torch.zeros(N, max_keep, dtype=torch.bool, device=x.device)
-        
-        for i, x_m in enumerate(x_masked_list):
-            length = x_m.shape[0]
-            x_masked_padded[i, :length] = x_m
-            keep_mask[i, :length] = True
-        
-        # Stack masks
-        mask = torch.stack(final_masks, dim=0)  # [N, L]
-        
-        return x_masked_padded, mask, ids_keep_list, ids_restore_list, keep_mask
-    
-    def forward_encoder(self, x, mask_ratio=0.75, hometown_len_list=None, destination_start_list=None, 
-                       destination_end_list=None, valid_mask=None, training=True):
-        """
-        Forward through encoder
-        x: [N, L, D]
-        hometown_len_list: list of int, length of hometown sequence for each sample
-        destination_start_list: list of int, start position of destination sequence
-        destination_end_list: list of int, end position of destination sequence
-        valid_mask: [N, L], True for valid positions
-        """
-        # Add pos embed (without cls token)
-        if x.shape[1] <= self.pos_embed.shape[1] - 1:  # -1 for cls token
-            x = x + self.pos_embed[:, 1:x.shape[1] + 1, :]  # Skip cls token pos embed
-        else:
-            # Handle sequences longer than expected
-            pos_embed_extended = self.pos_embed[:, 1:, :].repeat(1, (x.shape[1] // (self.pos_embed.shape[1] - 1)) + 1, 1)
-            x = x + pos_embed_extended[:, :x.shape[1], :]
-        
-        # Masking
-        if training:
-            x_masked, mask, ids_keep_list, ids_restore_list, keep_mask = self.random_masking(
-                x, mask_ratio, hometown_len_list, destination_start_list, destination_end_list, valid_mask
-            )
-        else:
-            x_masked, mask, ids_keep_list, ids_restore_list, keep_mask = self.fixed_masking(
-                x, hometown_len_list, destination_start_list, destination_end_list, valid_mask
-            )
-        
-        # Append cls token
-        cls_token = self.cls_token + self.pos_embed[:, :1, :]  # cls token + cls pos embed
-        cls_tokens = cls_token.expand(x_masked.shape[0], -1, -1)
-        x_masked = torch.cat((cls_tokens, x_masked), dim=1)
-        
-        # Update keep_mask to account for cls token
-        cls_mask = torch.ones(x_masked.shape[0], 1, dtype=torch.bool, device=x_masked.device)
-        keep_mask = torch.cat((cls_mask, keep_mask), dim=1)
-        
-        # Apply Transformer blocks
-        for blk in self.encoder_blocks:
-            x_masked = blk(x_masked, src_key_padding_mask=~keep_mask)
-        
-        x_masked = self.encoder_norm(x_masked)
-        
-        return x_masked, mask, ids_keep_list, ids_restore_list, keep_mask
-    
-    def forward_decoder(self, x_encoded, ids_keep_list, ids_restore_list, keep_mask, original_length):
-        """
-        Forward through decoder
-        """
-        N = len(ids_keep_list)
-        
-        # Embed tokens
-        x = self.decoder_embed(x_encoded)
-        
-        # Append mask tokens to sequence (similar to MaskedAutoencoderViT)
-        mask_tokens_list = []
-        x_no_cls_list = []
-        
-        for i in range(N):
-            ids_keep = ids_keep_list[i]
-            
-            # Remove cls token from encoded features
-            x_no_cls = x[i, 1:keep_mask[i].sum(), :]  # Skip cls token, get valid encoded tokens
-            x_no_cls_list.append(x_no_cls)
-            
-            # Calculate number of mask tokens needed
-            num_mask_tokens = original_length - len(ids_keep)
-            if num_mask_tokens > 0:
-                mask_tokens = self.mask_token.repeat(1, num_mask_tokens, 1).squeeze(0)  # [num_mask, D]
-            else:
-                mask_tokens = torch.empty(0, self.mask_token.shape[-1], device=x.device)
-            
-            mask_tokens_list.append(mask_tokens)
-        
-        # Concatenate encoded tokens and mask tokens for each sample
-        x_full_list = []
-        for i in range(N):
-            x_no_cls = x_no_cls_list[i]
-            mask_tokens = mask_tokens_list[i]
-            ids_keep = ids_keep_list[i]
-            
-            # Concatenate and unshuffle
-            x_concat = torch.cat([x_no_cls, mask_tokens], dim=0)  # [L, D]
-            
-            # Create indices for unshuffling (restore original order)
-            ids_restore = torch.argsort(torch.cat([ids_keep, torch.tensor([j for j in range(original_length) if j not in ids_keep], device=x.device)]))
-            
-            # Unshuffle to restore original sequence order
-            x_full = x_concat[ids_restore]  # [L, D]
-            
-            x_full_list.append(x_full)
-        
-        # Stack to create batch and add cls token back
-        x_full = torch.stack(x_full_list, dim=0)  # [N, L, D]
-        
-        # Add cls token back (at the beginning)
-        cls_tokens = x[:, :1, :]  # [N, 1, D] - keep cls token from encoder
-        x_full = torch.cat([cls_tokens, x_full], dim=1)  # [N, L+1, D]
-        
-        # Add pos embed
-        if x_full.shape[1] <= self.decoder_pos_embed.shape[1]:
-            x_full = x_full + self.decoder_pos_embed[:, :x_full.shape[1], :]
-        else:
-            # Handle sequences longer than expected
-            pos_embed_extended = self.decoder_pos_embed.repeat(1, (x_full.shape[1] // self.decoder_pos_embed.shape[1]) + 1, 1)
-            x_full = x_full + pos_embed_extended[:, :x_full.shape[1], :]
-        
-        # Apply Transformer blocks (using Encoder as Decoder)
-        for blk in self.decoder_blocks:
-            x_full = blk(x_full)
-        
-        x_full = self.decoder_norm(x_full)
-        
-        # Predictor projection
-        x_full = self.decoder_pred(x_full)  # [N, L+1, embed_dim]
-        
-        # Remove cls token from output
-        x_full = x_full[:, 1:, :]  # [N, L, embed_dim]
-        
-        return x_full
-    
-    def forward_loss(self, original, pred, mask, valid_mask=None):
-        """
-        Compute loss only on masked positions
-        original: [N, L, D]
-        pred: [N, L, D]
-        mask: [N, L], True for masked positions
-        valid_mask: [N, L], True for valid positions
-        """
-        if valid_mask is None:
-            valid_mask = torch.ones_like(mask, dtype=torch.bool)
-        
-        # Only compute loss on masked AND valid positions
-        loss_mask = mask & valid_mask  # [N, L]
-        
-        if loss_mask.sum() == 0:
-            return torch.tensor(0.0, device=original.device)
-        
-        # Compute MSE loss
-        loss = F.mse_loss(pred, original, reduction='none')  # [N, L, D]
-        loss = loss.mean(dim=-1)  # [N, L], mean loss per position
-        
-        # Apply mask and compute mean loss on masked positions
-        loss = (loss * loss_mask.float()).sum() / loss_mask.sum()
-        
-        return loss
-    
-    def forward(self, x, mask_ratio=0.75, hometown_len_list=None, destination_start_list=None, 
-               destination_end_list=None, valid_mask=None, training=True):
-        """
-        Forward pass
-        x: [N, L, D] input sequence (hometown + destination concatenated)
-        hometown_len_list: list of int, length of hometown sequence for each sample
-        destination_start_list: list of int, start position of destination sequence
-        destination_end_list: list of int, end position of destination sequence
-        valid_mask: [N, L] mask indicating valid positions (True for valid, False for padding)
-        """
-        original_length = x.shape[1]
-        
-        # Encoder
-        latent, mask, ids_keep_list, ids_restore_list, keep_mask = self.forward_encoder(
-            x, mask_ratio, hometown_len_list, destination_start_list, destination_end_list, valid_mask, training
-        )
-        
-        # Decoder
-        pred = self.forward_decoder(latent, ids_keep_list, ids_restore_list, keep_mask, original_length)
-        
-        # Loss (only during training)
-        if training:
-            loss = self.forward_loss(x, pred, mask, valid_mask)
-            return loss, pred, mask
-        else:
-            return pred, mask
-
 
 class Encoder(nn.Module):
     """Encoder mapping context sequences to parameters of the posterior q(z1)."""
@@ -968,6 +507,8 @@ class SPOTModel(nn.Module):
         # 初始化MaskedAutoEncoder
         if self.args.st_module:
             max_seq_len = max_length_ori_id + max_length_venue_id
+            # 使用main.py中设置的语义部分数量参数
+            num_semantic_parts = args.num_semantic_parts  # 默认0（禁用语义masking）
             self.mae = MaskedAutoEncoder(
                 seq_len=max_seq_len,
                 embed_dim=self.hidden_size,
@@ -976,7 +517,8 @@ class SPOTModel(nn.Module):
                 decoder_embed_dim=self.hidden_size,
                 decoder_depth=4,
                 decoder_num_heads=n_head,
-                mlp_ratio=4.0
+                mlp_ratio=4.0,
+                num_semantic_parts=num_semantic_parts
             )
 
         self.transformer_encoder = TransformerModel(embed_size=self.hidden_size * 2, nhead=n_head,
@@ -1464,7 +1006,7 @@ class SPOTModel(nn.Module):
             pad_vec = self.poi_embedding.emb.weight[0]
 
         if self.args.use_llm:
-            self.args.kg = False
+            # self.args.kg = False
             self.args.s_infer = False
             # 1. 通过LLM生成文本
             if self.args.use_target_llm:
@@ -1555,6 +1097,12 @@ class SPOTModel(nn.Module):
             destination_end_list = [o_valid_lens[i] + d_valid_lens[i] - 1 for i in range(batch_size)]  # 目的地终止位置
             
             if is_training:
+                # 设置LLM embedding作为cls_token（如果使用LLM）
+                if self.args.use_llm and generated_embeddings is not None:
+                    self.mae.set_external_cls_token(generated_embeddings)
+                else:
+                    self.mae.set_external_cls_token(None)
+                
                 # 训练时：随机掩码目的地序列的部分，保留起点终点
                 loss, pred, mask = self.mae(
                     combined_seq_padded,
@@ -1586,6 +1134,12 @@ class SPOTModel(nn.Module):
                 P_D = torch.stack(P_D_list, dim=0)  # [b, d_seq_len, d]
                 
             else:
+                # 设置LLM embedding作为cls_token（如果使用LLM）
+                if self.args.use_llm and generated_embeddings is not None:
+                    self.mae.set_external_cls_token(generated_embeddings)
+                else:
+                    self.mae.set_external_cls_token(None)
+                
                 # 推理时：mask除了目的地起点终点外的其他目的地序列部分
                 pred, mask = self.mae(
                     combined_seq_padded,
@@ -1709,3 +1263,14 @@ class SPOTModel(nn.Module):
                                                   confidence=torch.tensor(self.args.confidence),
                                                   threshold=0.8)
             return predicted_ids
+    
+    def set_mae_llm_embedding(self, P_L):
+        """
+        为MaskedAutoEncoder设置LLM embedding作为语义信息
+        Args:
+            P_L: [N, D] LLM embedding，用于生成语义感知的masking策略
+        """
+        if hasattr(self, 'mae') and self.mae is not None:
+            self.mae.set_external_cls_token(P_L)
+        else:
+            print("Warning: MaskedAutoEncoder is not initialized. Please enable st_module in args.")
