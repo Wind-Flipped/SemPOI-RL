@@ -25,6 +25,20 @@ class MaskedAutoEncoder(nn.Module):
         self.semantic_parts_embedding = None  # 用于存储语义部分信息
         self.pos_embed = nn.Parameter(torch.zeros(1, seq_len + 1, embed_dim), requires_grad=False)  # fixed sin-cos embedding, +1 for cls token
         
+        # 语义编码网络：用于生成 num_semantic_parts 个语义表征
+        # F_p = F_c ◦ sigmoid(W_{c2} tanh(W_{c1} F_c))
+        if num_semantic_parts > 0:
+            self.semantic_W_c1_list = nn.ModuleList([
+                nn.Linear(embed_dim, embed_dim) for _ in range(num_semantic_parts)
+            ])
+            self.semantic_W_c2_list = nn.ModuleList([
+                nn.Linear(embed_dim, embed_dim) for _ in range(num_semantic_parts)
+            ])
+            # 用于将语义表征与encoder输出结合的线性层
+            self.semantic_fusion_layer = nn.Linear(embed_dim * 2, embed_dim)
+            # 用于生成注意力权重的线性层
+            self.semantic_attention_layer = nn.Linear(embed_dim, 1)
+        
         self.encoder_blocks = nn.ModuleList([
             nn.TransformerEncoderLayer(
                 d_model=embed_dim,
@@ -94,8 +108,9 @@ class MaskedAutoEncoder(nn.Module):
     def _generate_semantic_parts(self, P_L):
         """
         根据LLM embedding生成语义部分信息
+        使用新的语义编码方法：F_p = F_c ◦ sigmoid(W_{c2} tanh(W_{c1} F_c))
         Args:
-            P_L: [N, embed_dim] 处理后的LLM embedding
+            P_L: [N, embed_dim] 处理后的LLM embedding (F_c)
         """
         # 如果num_semantic_parts为0，则不生成语义部分信息
         if self.num_semantic_parts == 0:
@@ -105,25 +120,61 @@ class MaskedAutoEncoder(nn.Module):
         batch_size = P_L.shape[0]
         device = P_L.device
         
-        # 将LLM embedding划分为num_semantic_parts个部分
-        part_dim = self.embed_dim // self.num_semantic_parts
+        # 生成 num_semantic_parts 个语义表征
+        # F_p = F_c ◦ sigmoid(W_{c2} tanh(W_{c1} F_c))
+        semantic_parts_list = []
         
-        # 生成语义部分的权重分布
-        semantic_weights = []
         for i in range(self.num_semantic_parts):
-            start_idx = i * part_dim
-            end_idx = min((i + 1) * part_dim, self.embed_dim)
-            part_embedding = P_L[:, start_idx:end_idx]  # [N, part_dim]
+            # W_{c1} F_c
+            h1 = self.semantic_W_c1_list[i](P_L)  # [N, embed_dim]
+            # tanh(W_{c1} F_c)
+            h1_tanh = torch.tanh(h1)  # [N, embed_dim]
+            # W_{c2} tanh(W_{c1} F_c)
+            h2 = self.semantic_W_c2_list[i](h1_tanh)  # [N, embed_dim]
+            # sigmoid(W_{c2} tanh(W_{c1} F_c))
+            gate = torch.sigmoid(h2)  # [N, embed_dim]
+            # F_p = F_c ◦ sigmoid(W_{c2} tanh(W_{c1} F_c))
+            F_p = P_L * gate  # [N, embed_dim] 元素级别乘法
             
-            # 计算该部分的重要性权重（使用L2范数）
-            part_weight = torch.norm(part_embedding, p=2, dim=-1, keepdim=True)  # [N, 1]
-            semantic_weights.append(part_weight)
+            semantic_parts_list.append(F_p)
         
-        # 将权重堆叠并归一化
-        semantic_weights = torch.cat(semantic_weights, dim=-1)  # [N, num_semantic_parts]
-        semantic_weights = F.softmax(semantic_weights, dim=-1)  # 归一化为概率分布
+        # 将所有语义表征堆叠：[N, num_semantic_parts, embed_dim]
+        self.semantic_parts_embedding = torch.stack(semantic_parts_list, dim=1)
+    
+    def apply_semantic_encoding(self, encoder_output):
+        """
+        将语义表征与encoder输出结合
+        Args:
+            encoder_output: [N, L, embed_dim] encoder的输出表征
+        Returns:
+            semantic_enhanced_output: [N, num_semantic_parts, L, embed_dim] 语义增强的表征
+        """
+        if self.num_semantic_parts == 0 or self.semantic_parts_embedding is None:
+            return None
+            
+        N, L, D = encoder_output.shape
+        # semantic_parts_embedding: [N, num_semantic_parts, embed_dim]
         
-        self.semantic_parts_embedding = semantic_weights  # [N, num_semantic_parts]
+        # 扩展语义表征到所有位置：[N, num_semantic_parts, L, embed_dim]
+        semantic_expanded = self.semantic_parts_embedding.unsqueeze(2).expand(-1, -1, L, -1)
+        
+        # 扩展encoder输出到所有语义部分：[N, num_semantic_parts, L, embed_dim]
+        encoder_expanded = encoder_output.unsqueeze(1).expand(-1, self.num_semantic_parts, -1, -1)
+        
+        # 拼接语义表征和encoder输出：[N, num_semantic_parts, L, 2*embed_dim]
+        combined = torch.cat([semantic_expanded, encoder_expanded], dim=-1)
+        
+        # 通过线性层融合：[N, num_semantic_parts, L, embed_dim]
+        fused = self.semantic_fusion_layer(combined)
+        
+        # 应用注意力机制生成权重
+        attention_scores = self.semantic_attention_layer(fused)  # [N, num_semantic_parts, L, 1]
+        attention_weights = torch.softmax(attention_scores, dim=1)  # 在语义部分维度上softmax
+        
+        # 加权融合：[N, num_semantic_parts, L, embed_dim]
+        semantic_enhanced = fused * attention_weights
+        
+        return semantic_enhanced
     
     def get_cls_token(self, batch_size, device):
         """
@@ -186,14 +237,7 @@ class MaskedAutoEncoder(nn.Module):
                               destination_start_list=None, destination_end_list=None, valid_mask=None):
         """
         实现语义感知的混合masking策略
-        Args:
-            x: [N, L, D] 输入序列
-            mask_ratio: 掩码比例
-            mask_lambda: 混合策略权重参数
-            hometown_len_list, destination_start_list, destination_end_list: 序列位置信息
-            valid_mask: 有效位置掩码
-        Returns:
-            x_masked, mask, ids_keep_list, ids_restore_list, keep_mask
+        注意：这个方法现在仅用于向后兼容，新的语义编码方法不需要这种masking策略
         """
         N, L, D = x.shape
         
@@ -205,184 +249,9 @@ class MaskedAutoEncoder(nn.Module):
             return self.random_masking(x, mask_ratio, hometown_len_list, 
                                      destination_start_list, destination_end_list, valid_mask)
         
-        # 获取语义权重 [N, num_semantic_parts]
-        semantic_weights = self.semantic_parts_embedding
-        
-        final_masks = []
-        ids_keep_list = []
-        ids_restore_list = []
-        x_masked_list = []
-        
-        for i in range(N):
-            # 获取当前样本的有效位置
-            valid_positions = torch.nonzero(valid_mask[i], as_tuple=True)[0]
-            
-            if len(valid_positions) == 0:
-                # 没有有效位置，保持原序列
-                ids_keep = torch.arange(L, device=x.device)
-                mask = torch.zeros(L, dtype=torch.bool, device=x.device)
-                x_masked = x[i]
-            else:
-                # 根据语义权重分配序列位置到不同语义部分
-                semantic_assignment = self._assign_positions_to_semantic_parts(
-                    valid_positions, semantic_weights[i])
-                
-                # 计算每个语义部分的mask数量
-                mask_per_part = self._calculate_semantic_mask_counts(
-                    semantic_assignment, mask_ratio, mask_lambda, L)
-                
-                # 生成最终的mask
-                mask = self._generate_semantic_mask(
-                    L, semantic_assignment, mask_per_part, valid_positions)
-                
-                # 获取保留的位置
-                keep_indices = torch.nonzero(~mask, as_tuple=True)[0]
-                ids_keep = keep_indices
-                x_masked = x[i, ids_keep, :]
-            
-            # 创建restore索引
-            ids_restore = torch.argsort(ids_keep)
-            
-            final_masks.append(mask)
-            ids_keep_list.append(ids_keep)
-            ids_restore_list.append(ids_restore)
-            x_masked_list.append(x_masked)
-        
-        # 填充到相同长度
-        max_keep = max(x_m.shape[0] for x_m in x_masked_list)
-        x_masked_padded = torch.zeros(N, max_keep, D, device=x.device)
-        keep_mask = torch.zeros(N, max_keep, dtype=torch.bool, device=x.device)
-        
-        for i, x_m in enumerate(x_masked_list):
-            length = x_m.shape[0]
-            x_masked_padded[i, :length] = x_m
-            keep_mask[i, :length] = True
-        
-        mask = torch.stack(final_masks, dim=0)
-        
-        return x_masked_padded, mask, ids_keep_list, ids_restore_list, keep_mask
-    
-    def _assign_positions_to_semantic_parts(self, valid_positions, semantic_weights):
-        """
-        根据语义权重将序列位置分配到不同的语义部分
-        Args:
-            valid_positions: 有效位置索引
-            semantic_weights: [num_semantic_parts] 语义权重
-        Returns:
-            semantic_assignment: dict, {part_id: [position_indices]}
-        """
-        num_positions = len(valid_positions)
-        device = valid_positions.device
-        
-        # 根据权重计算每个部分应该分配的位置数量
-        positions_per_part = (semantic_weights * num_positions).round().int()
-        
-        # 确保总数不超过可用位置数
-        while positions_per_part.sum() > num_positions:
-            max_idx = positions_per_part.argmax()
-            positions_per_part[max_idx] -= 1
-        
-        # 如果总数不足，补充到权重最大的部分
-        while positions_per_part.sum() < num_positions:
-            max_idx = semantic_weights.argmax()
-            positions_per_part[max_idx] += 1
-        
-        # 随机分配位置到各个部分
-        shuffled_positions = valid_positions[torch.randperm(num_positions, device=device)]
-        
-        semantic_assignment = {}
-        start_idx = 0
-        for part_id in range(self.num_semantic_parts):
-            count = positions_per_part[part_id].item()
-            if count > 0:
-                semantic_assignment[part_id] = shuffled_positions[start_idx:start_idx + count]
-                start_idx += count
-            else:
-                semantic_assignment[part_id] = torch.tensor([], dtype=torch.long, device=device)
-        
-        return semantic_assignment
-    
-    def _calculate_semantic_mask_counts(self, semantic_assignment, mask_ratio, mask_lambda, total_length):
-        """
-        计算每个语义部分的mask数量，实现混合masking策略
-        Args:
-            semantic_assignment: 语义部分分配
-            mask_ratio: 总体mask比例
-            mask_lambda: 混合权重
-            total_length: 序列总长度
-        Returns:
-            mask_counts: dict, {part_id: mask_count}
-        """
-        # 策略1：均匀masking - 每个部分按相同比例mask
-        mask_counts_uniform = {}
-        for part_id, positions in semantic_assignment.items():
-            if len(positions) > 0:
-                mask_counts_uniform[part_id] = int(len(positions) * mask_ratio)
-            else:
-                mask_counts_uniform[part_id] = 0
-        
-        # 策略2：平衡masking - 考虑全局约束
-        total_positions = sum(len(positions) for positions in semantic_assignment.values())
-        target_total_masks = int(total_positions * mask_ratio)
-        
-        # 随机排序语义部分
-        part_ids = list(range(self.num_semantic_parts))
-        random.shuffle(part_ids)
-        
-        mask_counts_balanced = {}
-        cumulative_masks = 0
-        
-        for part_id in part_ids:
-            positions = semantic_assignment[part_id]
-            if len(positions) == 0:
-                mask_counts_balanced[part_id] = 0
-                continue
-            
-            remaining_masks = target_total_masks - cumulative_masks
-            max_possible = len(positions)
-            
-            if remaining_masks <= 0:
-                mask_counts_balanced[part_id] = 0
-            else:
-                mask_count = min(max_possible, remaining_masks)
-                mask_counts_balanced[part_id] = mask_count
-                cumulative_masks += mask_count
-        
-        # 混合两种策略
-        final_mask_counts = {}
-        for part_id in range(self.num_semantic_parts):
-            count1 = mask_counts_uniform.get(part_id, 0)
-            count2 = mask_counts_balanced.get(part_id, 0)
-            final_count = int(mask_lambda * count1 + (1 - mask_lambda) * count2)
-            final_mask_counts[part_id] = final_count
-        
-        return final_mask_counts
-    
-    def _generate_semantic_mask(self, seq_length, semantic_assignment, mask_counts, valid_positions):
-        """
-        根据语义分配和mask计数生成最终的mask
-        Args:
-            seq_length: 序列长度
-            semantic_assignment: 语义部分分配
-            mask_counts: 每个部分的mask数量
-            valid_positions: 有效位置
-        Returns:
-            mask: [seq_length] bool tensor
-        """
-        device = valid_positions.device
-        mask = torch.zeros(seq_length, dtype=torch.bool, device=device)
-        
-        for part_id, positions in semantic_assignment.items():
-            mask_count = mask_counts.get(part_id, 0)
-            if len(positions) > 0 and mask_count > 0:
-                # 在该部分的位置中随机选择要mask的位置
-                mask_count = min(mask_count, len(positions))
-                if mask_count > 0:
-                    indices_to_mask = torch.randperm(len(positions), device=device)[:mask_count]
-                    positions_to_mask = positions[indices_to_mask]
-                    mask[positions_to_mask] = True
-        
-        return mask
+        # 新的语义编码方法不需要特殊的masking，直接使用随机masking
+        return self.random_masking(x, mask_ratio, hometown_len_list, 
+                                 destination_start_list, destination_end_list, valid_mask)
     
     def random_masking(self, x, mask_ratio, hometown_len_list=None, destination_start_list=None, destination_end_list=None, valid_mask=None):
         """
@@ -579,12 +448,14 @@ class MaskedAutoEncoder(nn.Module):
         """
         Forward through encoder
         x: [N, L, D]
-        mask_lambda: 语义感知masking的混合权重参数
+        mask_lambda: 语义感知masking的混合权重参数（已弃用，新语义编码不使用特殊masking）
         hometown_len_list: list of int, length of hometown sequence for each sample
         destination_start_list: list of int, start position of destination sequence
         destination_end_list: list of int, end position of destination sequence
         valid_mask: [N, L], True for valid positions
-        use_semantic_masking: 是否使用语义感知masking策略
+        use_semantic_masking: 语义感知masking开关（已弃用，新语义编码在decoder中处理）
+        
+        注意：新的语义编码方法在decoder阶段进行语义增强，encoder阶段使用标准的随机masking
         """
         # Add pos embed (without cls token)
         if x.shape[1] <= self.pos_embed.shape[1] - 1:  # -1 for cls token
@@ -594,18 +465,12 @@ class MaskedAutoEncoder(nn.Module):
             pos_embed_extended = self.pos_embed[:, 1:, :].repeat(1, (x.shape[1] // (self.pos_embed.shape[1] - 1)) + 1, 1)
             x = x + pos_embed_extended[:, :x.shape[1], :]
         
-        # Masking - 根据参数选择masking策略
+        # Masking - 新语义编码方法统一使用随机masking
         if training:
-            if use_semantic_masking and self.num_semantic_parts > 0 and self.semantic_parts_embedding is not None:
-                # 使用语义感知masking策略
-                x_masked, mask, ids_keep_list, ids_restore_list, keep_mask = self.semantic_aware_masking(
-                    x, mask_ratio, mask_lambda, hometown_len_list, destination_start_list, destination_end_list, valid_mask
-                )
-            else:
-                # 使用原始随机masking策略
-                x_masked, mask, ids_keep_list, ids_restore_list, keep_mask = self.random_masking(
-                    x, mask_ratio, hometown_len_list, destination_start_list, destination_end_list, valid_mask
-                )
+            # 使用随机masking策略（新语义编码在decoder中处理）
+            x_masked, mask, ids_keep_list, ids_restore_list, keep_mask = self.random_masking(
+                x, mask_ratio, hometown_len_list, destination_start_list, destination_end_list, valid_mask
+            )
         else:
             x_masked, mask, ids_keep_list, ids_restore_list, keep_mask = self.fixed_masking(
                 x, hometown_len_list, destination_start_list, destination_end_list, valid_mask
@@ -630,7 +495,46 @@ class MaskedAutoEncoder(nn.Module):
     
     def forward_decoder(self, x_encoded, ids_keep_list, ids_restore_list, keep_mask, original_length):
         """
-        Forward through decoder
+        Forward through decoder with semantic enhancement
+        """
+        N = len(ids_keep_list)
+        
+        # 如果启用了语义编码，应用语义增强
+        if self.num_semantic_parts > 0 and self.semantic_parts_embedding is not None:
+            # 移除cls token进行语义增强
+            x_no_cls = x_encoded[:, 1:, :]  # [N, L, embed_dim]
+            
+            # 应用语义编码：[N, num_semantic_parts, L, embed_dim]
+            semantic_enhanced = self.apply_semantic_encoding(x_no_cls)
+            
+            if semantic_enhanced is not None:
+                # 对每个语义部分分别进行decoder处理
+                semantic_outputs = []
+                
+                for part_idx in range(self.num_semantic_parts):
+                    # 取出当前语义部分的表征：[N, L, embed_dim]
+                    current_semantic = semantic_enhanced[:, part_idx, :, :]
+                    
+                    # 重新添加cls token
+                    cls_tokens = x_encoded[:, :1, :]  # [N, 1, embed_dim]
+                    current_with_cls = torch.cat([cls_tokens, current_semantic], dim=1)
+                    
+                    # 进行decoder处理
+                    decoded_part = self._decode_single_semantic(
+                        current_with_cls, ids_keep_list, ids_restore_list, keep_mask, original_length
+                    )
+                    semantic_outputs.append(decoded_part)
+                
+                # 归一化相加所有语义部分的输出：[N, L, embed_dim]
+                final_output = torch.stack(semantic_outputs, dim=0).mean(dim=0)
+                return final_output
+        
+        # 如果没有语义编码，使用原始decoder
+        return self._decode_single_semantic(x_encoded, ids_keep_list, ids_restore_list, keep_mask, original_length)
+    
+    def _decode_single_semantic(self, x_encoded, ids_keep_list, ids_restore_list, keep_mask, original_length):
+        """
+        对单个语义表征进行decoder处理（原始decoder逻辑）
         """
         N = len(ids_keep_list)
         
@@ -733,20 +637,22 @@ class MaskedAutoEncoder(nn.Module):
     def forward(self, x, mask_ratio=0.75, mask_lambda=1.0, hometown_len_list=None, destination_start_list=None, 
                destination_end_list=None, valid_mask=None, training=True, use_semantic_masking=True):
         """
-        Forward pass
+        Forward pass with new semantic encoding system
         x: [N, L, D] input sequence (hometown + destination concatenated)
-        mask_lambda: 语义感知masking的混合权重参数 (0.0-1.0)
+        mask_lambda: 已弃用参数，保留为向后兼容
         hometown_len_list: list of int, length of hometown sequence for each sample
         destination_start_list: list of int, start position of destination sequence
         destination_end_list: list of int, end position of destination sequence
         valid_mask: [N, L] mask indicating valid positions (True for valid, False for padding)
-        use_semantic_masking: 是否使用语义感知masking策略
+        use_semantic_masking: 已弃用参数，保留为向后兼容
         
-        Note: 
-        1. 使用 set_external_cls_token() 方法来设置 LLM embedding 作为 cls_token，
-           这会自动生成语义部分信息用于语义感知masking
-        2. 当 num_semantic_parts = 0 时，即使设置了LLM embedding，也只使用随机masking策略
-        3. 当 use_semantic_masking = False 时，强制使用随机masking策略
+        新语义编码系统工作流程:
+        1. 使用 set_external_cls_token() 设置 LLM embedding 作为语义编码基础 (F_c)
+        2. 通过 F_p = F_c ◦ sigmoid(W_{c2} tanh(W_{c1} F_c)) 生成 num_semantic_parts 个语义表征
+        3. Encoder 阶段使用标准随机masking
+        4. Decoder 阶段对每个语义表征分别处理，最后归一化相加得到最终预测
+        
+        当 num_semantic_parts = 0 时，使用标准的MAE流程（无语义增强）
         """
         original_length = x.shape[1]
         
