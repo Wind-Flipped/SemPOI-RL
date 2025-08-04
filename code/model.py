@@ -519,7 +519,8 @@ class SPOTModel(nn.Module):
                 decoder_depth=4,
                 decoder_num_heads=n_head,
                 mlp_ratio=4.0,
-                num_semantic_parts=num_semantic_parts
+                num_semantic_parts=num_semantic_parts,
+                lambda_diversity=args.lambda_diversity
             )
 
         self.transformer_encoder = TransformerModel(embed_size=self.hidden_size * 2, nhead=n_head,
@@ -550,55 +551,6 @@ class SPOTModel(nn.Module):
         self.head_linear = nn.Linear(self.hidden_size, self.hidden_size)
         self.tail_linear = nn.Linear(self.hidden_size, self.hidden_size)
         self.criterion = nn.CrossEntropyLoss(ignore_index=0)  # Ignore padding index during loss calculation
-
-    def generate_square_subsequent_mask(self, sz):
-        """生成causal mask，防止未来位置的信息泄露"""
-        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
-        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
-        return mask
-    
-    def generate_mask_for_mae(self, batch_size, seq_len, mask_ratio=0.75, preserve_start_end=True, training=True):
-        """
-        生成用于Masked AutoEncoder的掩码
-        Args:
-            batch_size: 批次大小
-            seq_len: 序列长度
-            mask_ratio: 掩码比例 (默认0.75)
-            preserve_start_end: 是否保留起点和终点不被掩码 (默认True)
-            training: 是否为训练模式 (训练时随机掩码，推理时固定掩码)
-        Returns:
-            mask: bool tensor [batch_size, seq_len], True表示被掩码的位置
-        """
-        device = next(self.parameters()).device
-        mask = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
-        
-        for i in range(batch_size):
-            if preserve_start_end and seq_len > 2:
-                # 保留起点(位置0)和终点(位置seq_len-1)不被掩码
-                maskable_positions = list(range(1, seq_len - 1))
-                if training:
-                    # 训练时：随机掩码中间位置
-                    num_mask = int(len(maskable_positions) * mask_ratio)
-                    if num_mask > 0:
-                        masked_indices = torch.randperm(len(maskable_positions))[:num_mask]
-                        masked_positions = [maskable_positions[idx] for idx in masked_indices]
-                        mask[i, masked_positions] = True
-                else:
-                    # 推理时：固定掩码策略，掩码除起点终点外的所有位置
-                    mask[i, 1:-1] = True
-            else:
-                # 不保留起点终点的情况
-                if training:
-                    # 训练时：随机掩码
-                    num_mask = int(seq_len * mask_ratio)
-                    if num_mask > 0:
-                        masked_indices = torch.randperm(seq_len)[:num_mask]
-                        mask[i, masked_indices] = True
-                else:
-                    # 推理时：掩码所有位置
-                    mask[i, :] = True
-        
-        return mask
 
     def calc_kg_loss_transE(self, h, r, pos_t, neg_t):
         """

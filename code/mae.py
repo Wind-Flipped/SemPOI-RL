@@ -11,12 +11,14 @@ class MaskedAutoEncoder(nn.Module):
     
     def __init__(self, seq_len=100, embed_dim=128, depth=6, num_heads=8,
                  decoder_embed_dim=128, decoder_depth=4, decoder_num_heads=8,
-                 mlp_ratio=4., norm_layer=nn.LayerNorm, num_semantic_parts=8):
+                 mlp_ratio=4., norm_layer=nn.LayerNorm, num_semantic_parts=8,
+                 lambda_diversity=0.1):
         super().__init__()
         
         self.seq_len = seq_len
         self.embed_dim = embed_dim
         self.num_semantic_parts = num_semantic_parts  # 语义部分数量
+        self.lambda_diversity = lambda_diversity  # 语义多样性损失权重
         
         # --------------------------------------------------------------------------
         # MAE encoder specifics
@@ -256,6 +258,7 @@ class MaskedAutoEncoder(nn.Module):
     def random_masking(self, x, mask_ratio, hometown_len_list=None, destination_start_list=None, destination_end_list=None, valid_mask=None):
         """
         Perform per-sample random masking by per-sample shuffling for destination sequences.
+        Training时：可以mask整个destination sequence（包括头部和尾部位置）
         x: [N, L, D], sequence (hometown + destination concatenated)
         hometown_len_list: list of int, length of hometown sequence for each sample
         destination_start_list: list of int, start position of destination sequence in concatenated sequence
@@ -280,12 +283,12 @@ class MaskedAutoEncoder(nn.Module):
                 dest_start = destination_start_list[i]
                 dest_end = destination_end_list[i]
                 
-                # Create mask - only mask destination sequence (excluding start and end)
+                # Create mask - mask destination sequence (including start and end)
                 mask = torch.zeros(L, dtype=torch.bool, device=x.device)
                 
-                if dest_end > dest_start + 1:  # At least one position between start and end
-                    # Maskable positions: middle positions of destination sequence
-                    maskable_positions = torch.arange(dest_start + 1, dest_end, device=x.device)
+                if dest_end > dest_start:  # At least one position in destination sequence
+                    # Maskable positions: all positions of destination sequence (including start and end)
+                    maskable_positions = torch.arange(dest_start, dest_end, device=x.device)
                     
                     # Filter by valid mask
                     maskable_positions = maskable_positions[valid_mask[i, maskable_positions]]
@@ -312,22 +315,17 @@ class MaskedAutoEncoder(nn.Module):
                     ids_keep = torch.arange(L, device=x.device)
                     mask = torch.zeros(L, dtype=torch.bool, device=x.device)
                 else:
-                    # Preserve first and last valid positions
-                    if len(valid_positions) > 2:
-                        start_pos = valid_positions[0]
-                        end_pos = valid_positions[-1]
-                        maskable_positions = valid_positions[1:-1]
-                        
-                        num_mask = int(len(maskable_positions) * mask_ratio)
-                        mask = torch.zeros(L, dtype=torch.bool, device=x.device)
-                        
-                        if num_mask > 0:
-                            noise = torch.rand(len(maskable_positions), device=x.device)
-                            ids_shuffle = torch.argsort(noise)
-                            mask_indices = maskable_positions[ids_shuffle[:num_mask]]
-                            mask[mask_indices] = True
-                    else:
-                        mask = torch.zeros(L, dtype=torch.bool, device=x.device)
+                    # Mask any valid positions (including first and last)
+                    maskable_positions = valid_positions
+                    
+                    num_mask = int(len(maskable_positions) * mask_ratio)
+                    mask = torch.zeros(L, dtype=torch.bool, device=x.device)
+                    
+                    if num_mask > 0:
+                        noise = torch.rand(len(maskable_positions), device=x.device)
+                        ids_shuffle = torch.argsort(noise)
+                        mask_indices = maskable_positions[ids_shuffle[:num_mask]]
+                        mask[mask_indices] = True
                     
                     keep_indices = torch.nonzero(~mask, as_tuple=True)[0]
                     ids_keep = keep_indices
@@ -626,18 +624,105 @@ class MaskedAutoEncoder(nn.Module):
             return torch.tensor(0.0, device=original.device)
         
         # Compute MSE loss
-        loss = F.mse_loss(pred, original, reduction='none')  # [N, L, D]
-        loss = loss.mean(dim=-1)  # [N, L], mean loss per position
+        mse_loss = F.mse_loss(pred, original, reduction='none')  # [N, L, D]
+        mse_loss = mse_loss.mean(dim=-1)  # [N, L], mean loss per position
         
         # Apply mask and compute mean loss on masked positions
-        loss = (loss * loss_mask.float()).sum() / loss_mask.sum()
+        reconstruction_loss = (mse_loss * loss_mask.float()).sum() / loss_mask.sum()
         
-        return loss
+        # 计算语义多样性损失（如果启用了语义编码）
+        diversity_loss = self.compute_semantic_diversity_loss()
+        
+        # 总损失
+        total_loss = reconstruction_loss + diversity_loss
+        
+        return total_loss
+    
+    def forward_loss_detailed(self, original, pred, mask, valid_mask=None):
+        """
+        计算详细的损失信息，返回重建损失和多样性损失的分别值
+        Args:
+            original: [N, L, D] 原始输入
+            pred: [N, L, D] 预测输出
+            mask: [N, L] 掩码
+            valid_mask: [N, L] 有效位置掩码
+        Returns:
+            dict: 包含各种损失的字典
+        """
+        if valid_mask is None:
+            valid_mask = torch.ones_like(mask, dtype=torch.bool)
+        
+        # Only compute loss on masked AND valid positions
+        loss_mask = mask & valid_mask  # [N, L]
+        
+        if loss_mask.sum() == 0:
+            return {
+                'total_loss': torch.tensor(0.0, device=original.device),
+                'reconstruction_loss': torch.tensor(0.0, device=original.device),
+                'diversity_loss': torch.tensor(0.0, device=original.device)
+            }
+        
+        # Compute MSE loss
+        mse_loss = F.mse_loss(pred, original, reduction='none')  # [N, L, D]
+        mse_loss = mse_loss.mean(dim=-1)  # [N, L], mean loss per position
+        
+        # Apply mask and compute mean loss on masked positions
+        reconstruction_loss = (mse_loss * loss_mask.float()).sum() / loss_mask.sum()
+        
+        # 计算语义多样性损失（如果启用了语义编码）
+        diversity_loss = self.compute_semantic_diversity_loss()
+        
+        # 总损失
+        total_loss = reconstruction_loss + diversity_loss
+        
+        return {
+            'total_loss': total_loss,
+            'reconstruction_loss': reconstruction_loss,
+            'diversity_loss': diversity_loss,
+            'diversity_weight': self.lambda_diversity
+        }
+    
+    def compute_semantic_diversity_loss(self):
+        """
+        计算语义表征多样性损失：所有互不相同表征的余弦相似度之和并归一化
+        使用高效的矩阵运算实现
+        Returns:
+            diversity_loss: 多样性损失值
+        """
+        # 如果没有语义编码或语义部分数量少于2，则不计算多样性损失
+        if (self.num_semantic_parts <= 1 or 
+            self.semantic_parts_embedding is None):
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+        
+        # semantic_parts_embedding: [N, num_semantic_parts, embed_dim]
+        N, num_parts, embed_dim = self.semantic_parts_embedding.shape
+        
+        # 归一化语义表征以计算余弦相似度
+        semantic_normalized = F.normalize(self.semantic_parts_embedding, p=2, dim=-1)  # [N, num_parts, embed_dim]
+        
+        # 计算所有表征对之间的余弦相似度矩阵
+        # 通过矩阵乘法计算：[N, num_parts, embed_dim] @ [N, embed_dim, num_parts] = [N, num_parts, num_parts]
+        cosine_matrix = torch.bmm(semantic_normalized, semantic_normalized.transpose(1, 2))  # [N, num_parts, num_parts]
+        
+        # 创建上三角掩码，排除对角线元素（自己与自己的相似度）
+        mask = torch.triu(torch.ones(num_parts, num_parts, device=cosine_matrix.device), diagonal=1).bool()
+        
+        # 只保留上三角部分（不包括对角线），避免重复计算
+        upper_triangle_similarities = cosine_matrix[:, mask]  # [N, num_pairs]
+        
+        # 计算平均余弦相似度
+        average_cosine_similarity = upper_triangle_similarities.mean()
+        
+        # 多样性损失：我们希望余弦相似度尽可能小（表征尽可能不同）
+        # 因此损失为相似度的平均值，乘以权重系数
+        diversity_loss = self.lambda_diversity * average_cosine_similarity
+        
+        return diversity_loss
     
     def forward(self, x, mask_ratio=0.75, mask_lambda=1.0, hometown_len_list=None, destination_start_list=None, 
                destination_end_list=None, valid_mask=None, training=True, use_semantic_masking=True):
         """
-        Forward pass with new semantic encoding system
+        Forward pass with new semantic encoding system and diversity loss
         x: [N, L, D] input sequence (hometown + destination concatenated)
         mask_lambda: 已弃用参数，保留为向后兼容
         hometown_len_list: list of int, length of hometown sequence for each sample
@@ -652,7 +737,13 @@ class MaskedAutoEncoder(nn.Module):
         3. Encoder 阶段使用标准随机masking
         4. Decoder 阶段对每个语义表征分别处理，最后归一化相加得到最终预测
         
-        当 num_semantic_parts = 0 时，使用标准的MAE流程（无语义增强）
+        损失函数组成:
+        - 重建损失: 标准的MSE损失，计算masked位置的重建误差
+        - 多样性损失: 计算所有语义表征对之间的余弦相似度，鼓励表征多样性
+        - 总损失 = 重建损失 + lambda_diversity * 多样性损失
+        
+        当 num_semantic_parts = 0 时，使用标准的MAE流程（无语义增强，无多样性损失）
+        当 num_semantic_parts <= 1 时，不计算多样性损失
         """
         original_length = x.shape[1]
         

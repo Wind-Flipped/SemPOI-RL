@@ -112,6 +112,7 @@ def main():
     parser.add_argument("--st_module", action="store_true", help="use SpatialTemporal module")
     # Semantic Masking parameters
     parser.add_argument("--num_semantic_parts", type=int, default=0, help="Number of semantic parts for semantic-aware masking in MAE. Set to 0 to disable semantic masking and use random masking only.")
+    parser.add_argument("--lambda_diversity", type=float, default=0.1, help="Weight for diversity loss in MAE.")
 
     # Yelp: ../dataset/Yelp_20250714_192438
     # Foursquare: ../dataset/travel_dataset_20250712_201017
