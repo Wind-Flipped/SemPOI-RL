@@ -940,7 +940,7 @@ class SPOTModel(nn.Module):
             padded_list.append(padded_seq)
         return torch.stack(padded_list, dim=0)
 
-    def forward(self, messages, o_ck, query, o_t, d_t, o_l, d_l, o_pad, d_pad, d_ck, o_rg, d_rg, target_seq=None):
+    def forward(self, uid, messages, o_ck, query, o_t, d_t, o_l, d_l, o_pad, d_pad, d_ck, o_rg, d_rg, target_seq=None):
         batch_size, seq_length = query.size()
         # region_repr = self.region_embedding.weight
         region_mask = torch.stack([self.region_masks[int(r)] for r in d_rg], dim=0)
@@ -1059,7 +1059,8 @@ class SPOTModel(nn.Module):
                 # 训练时：随机掩码目的地序列的部分，保留起点终点
                 loss, pred, mask = self.mae(
                     combined_seq_padded,
-                    mask_ratio=0.5,
+                    uid=uid,
+                    mask_ratio=self.args.mask_ratio,  # 这个参数在训练时使用
                     hometown_len_list=hometown_len_list,
                     destination_start_list=destination_start_list,
                     destination_end_list=destination_end_list,
@@ -1096,7 +1097,8 @@ class SPOTModel(nn.Module):
                 # 推理时：mask除了目的地起点终点外的其他目的地序列部分
                 pred, mask = self.mae(
                     combined_seq_padded,
-                    mask_ratio=0.5,  # 这个参数在推理时不使用
+                    uid=uid,
+                    mask_ratio=self.args.mask_ratio,  # 这个参数在推理时不使用
                     hometown_len_list=hometown_len_list,
                     destination_start_list=destination_start_list,
                     destination_end_list=destination_end_list,

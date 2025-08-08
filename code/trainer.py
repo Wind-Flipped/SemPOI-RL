@@ -256,7 +256,7 @@ def train_single_phase(model, train_loader, valid_loader, test_loader, args, log
 
             optimizer.zero_grad()
             if args.model == 'SPOT-Trip':
-                loss = model(messages, o_ck, masked_d_ck, o_t, d_t, o_l, d_l, o_pad, d_pad, d_ck, o_rg, d_rg,
+                loss = model(uid, messages, o_ck, masked_d_ck, o_t, d_t, o_l, d_l, o_pad, d_pad, d_ck, o_rg, d_rg,
                              target_seq=d_ck)
             if args.model == 'AR-Trip':
                 poi_output, loss = model(masked_d_ck, masked_d_h, train_am, train_pm, d_ck, d_rg)
@@ -303,7 +303,7 @@ def train_single_phase(model, train_loader, valid_loader, test_loader, args, log
                 o_rg = o_rg.to(args.device)
                 d_rg = d_rg.to(args.device)
                 if args.model == 'SPOT-Trip':
-                    predicted_ids = model(messages, o_ck, masked_d_ck, o_t, d_t, o_l, d_l, o_pad, d_pad, d_ck, o_rg,
+                    predicted_ids = model(uid, messages, o_ck, masked_d_ck, o_t, d_t, o_l, d_l, o_pad, d_pad, d_ck, o_rg,
                                           d_rg, target_seq=None)
                     # Process each sample in the batch separately
                 elif args.model == 'AR-Trip':
@@ -422,7 +422,7 @@ def get_test_result(model, test_loader, args, logger, prompts, references):
         o_rg = o_rg.to(args.device)
         d_rg = d_rg.to(args.device)
         if args.model == 'SPOT-Trip':
-            predicted_ids = model(messages, o_ck, masked_d_ck, o_t, d_t, o_l, d_l, o_pad, d_pad, d_ck, o_rg, d_rg,
+            predicted_ids = model(uid, messages, o_ck, masked_d_ck, o_t, d_t, o_l, d_l, o_pad, d_pad, d_ck, o_rg, d_rg,
                                   target_seq=None)
         # Process each sample in the batch separately
         for i in range(predicted_ids.shape[0]):

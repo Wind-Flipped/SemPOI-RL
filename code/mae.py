@@ -143,16 +143,21 @@ class MaskedAutoEncoder(nn.Module):
         # 将所有语义表征堆叠：[N, num_semantic_parts, embed_dim]
         self.semantic_parts_embedding = torch.stack(semantic_parts_list, dim=1)
     
-    def apply_semantic_encoding(self, encoder_output):
+    def apply_semantic_encoding(self, encoder_output, return_attention_weights=False):
         """
         将语义表征与encoder输出结合
         Args:
             encoder_output: [N, L, embed_dim] encoder的输出表征
+            return_attention_weights: bool, 是否返回注意力权重信息
         Returns:
             semantic_enhanced_output: [N, num_semantic_parts, L, embed_dim] 语义增强的表征
+            attention_weights: (optional) [N, num_semantic_parts, L, 1] 注意力权重
         """
         if self.num_semantic_parts == 0 or self.semantic_parts_embedding is None:
-            return None
+            if return_attention_weights:
+                return None, None
+            else:
+                return None
             
         N, L, D = encoder_output.shape
         # semantic_parts_embedding: [N, num_semantic_parts, embed_dim]
@@ -176,7 +181,10 @@ class MaskedAutoEncoder(nn.Module):
         # 加权融合：[N, num_semantic_parts, L, embed_dim]
         semantic_enhanced = fused * attention_weights
         
-        return semantic_enhanced
+        if return_attention_weights:
+            return semantic_enhanced, attention_weights
+        else:
+            return semantic_enhanced
     
     def get_cls_token(self, batch_size, device):
         """
@@ -491,9 +499,15 @@ class MaskedAutoEncoder(nn.Module):
         
         return x_masked, mask, ids_keep_list, ids_restore_list, keep_mask
     
-    def forward_decoder(self, x_encoded, ids_keep_list, ids_restore_list, keep_mask, original_length):
+    def forward_decoder(self, x_encoded, ids_keep_list, ids_restore_list, keep_mask, original_length, 
+                      uid=None, destination_start_list=None, destination_end_list=None, training=True):
         """
         Forward through decoder with semantic enhancement
+        Args:
+            uid: list of user IDs for each sample in batch
+            destination_start_list: list of destination start positions
+            destination_end_list: list of destination end positions  
+            training: whether in training mode
         """
         N = len(ids_keep_list)
         
@@ -503,7 +517,31 @@ class MaskedAutoEncoder(nn.Module):
             x_no_cls = x_encoded[:, 1:, :]  # [N, L, embed_dim]
             
             # 应用语义编码：[N, num_semantic_parts, L, embed_dim]
-            semantic_enhanced = self.apply_semantic_encoding(x_no_cls)
+            # 在推理时获取注意力权重信息
+            if not training:
+                semantic_enhanced, attention_weights = self.apply_semantic_encoding(x_no_cls, return_attention_weights=True)
+                
+                # 记录每个位置的最大权重语义表征序号
+                if attention_weights is not None and uid is not None and destination_start_list is not None and destination_end_list is not None:
+                    # attention_weights: [N, num_semantic_parts, L, 1]
+                    max_semantic_indices = torch.argmax(attention_weights.squeeze(-1), dim=1)  # [N, L]
+                    
+                    # 为每个样本打印目的地序列的最大语义表征序号
+                    for i in range(N):
+                        user_id = uid[i] if isinstance(uid[i], (int, str)) else uid[i].item()
+                        dest_start = destination_start_list[i]
+                        dest_end = destination_end_list[i]
+                        
+                        if dest_end > dest_start:
+                            # 获取目的地序列的语义表征序号
+                            dest_semantic_indices = max_semantic_indices[i, dest_start:dest_end]
+                            dest_semantic_list = dest_semantic_indices.cpu().numpy().tolist()
+                            
+                            print(f"[推理] 用户 {user_id} 的目的地序列语义表征序号: {dest_semantic_list}")
+                            print(f"  - 目的地序列长度: {dest_end - dest_start}")
+                            print(f"  - 语义表征分布: {dict(zip(*torch.unique(dest_semantic_indices, return_counts=True)))}")
+            else:
+                semantic_enhanced = self.apply_semantic_encoding(x_no_cls, return_attention_weights=False)
             
             if semantic_enhanced is not None:
                 # 对每个语义部分分别进行decoder处理
@@ -719,7 +757,7 @@ class MaskedAutoEncoder(nn.Module):
         
         return diversity_loss
     
-    def forward(self, x, mask_ratio=0.75, mask_lambda=1.0, hometown_len_list=None, destination_start_list=None, 
+    def forward(self, x, uid, mask_ratio=0.75, mask_lambda=1.0, hometown_len_list=None, destination_start_list=None,
                destination_end_list=None, valid_mask=None, training=True, use_semantic_masking=True):
         """
         Forward pass with new semantic encoding system and diversity loss
@@ -753,7 +791,8 @@ class MaskedAutoEncoder(nn.Module):
         )
         
         # Decoder
-        pred = self.forward_decoder(latent, ids_keep_list, ids_restore_list, keep_mask, original_length)
+        pred = self.forward_decoder(latent, ids_keep_list, ids_restore_list, keep_mask, original_length,
+                                  uid, destination_start_list, destination_end_list, training)
         
         # Loss (only during training)
         if training:

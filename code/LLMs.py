@@ -219,7 +219,7 @@ class TravelStyleRewardCalculator:
         Args:
             similarity_model: 用于计算文本相似度的模型
         """
-        self.similarity_model = SentenceTransformer(similarity_model, device="cuda:2")
+        self.similarity_model = SentenceTransformer(similarity_model, device="cuda:1")
         logger.info(f"Reward calculator initialized with {similarity_model}")
 
     def calculate_similarity(self, text1: str, text2: str) -> float:
