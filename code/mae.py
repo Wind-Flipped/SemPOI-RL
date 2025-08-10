@@ -14,19 +14,23 @@ class MaskedAutoEncoder(nn.Module):
                  mlp_ratio=4., norm_layer=nn.LayerNorm, num_semantic_parts=8,
                  lambda_diversity=0.1):
         super().__init__()
-        
+
         self.seq_len = seq_len
         self.embed_dim = embed_dim
         self.num_semantic_parts = num_semantic_parts  # 语义部分数量
         self.lambda_diversity = lambda_diversity  # 语义多样性损失权重
-        
+
         # --------------------------------------------------------------------------
         # MAE encoder specifics
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        # 用于在Encoder侧重建完整序列时填充被mask的位置（仅用于语义打印，不参与反向传播）
+        self.encoder_mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.external_cls_token = None  # 用于存储外部LLM embedding作为cls_token
         self.semantic_parts_embedding = None  # 用于存储语义部分信息
-        self.pos_embed = nn.Parameter(torch.zeros(1, seq_len + 1, embed_dim), requires_grad=False)  # fixed sin-cos embedding, +1 for cls token
-        
+        self.pos_embed = nn.Parameter(
+            torch.zeros(1, seq_len + 1, embed_dim), requires_grad=False
+        )  # fixed sin-cos embedding, +1 for cls token
+
         # 语义编码网络：用于生成 num_semantic_parts 个语义表征
         # F_p = F_c ◦ sigmoid(W_{c2} tanh(W_{c1} F_c))
         if num_semantic_parts > 0:
@@ -40,7 +44,7 @@ class MaskedAutoEncoder(nn.Module):
             self.semantic_fusion_layer = nn.Linear(embed_dim * 2, embed_dim)
             # 用于生成注意力权重的线性层
             self.semantic_attention_layer = nn.Linear(embed_dim, 1)
-        
+
         self.encoder_blocks = nn.ModuleList([
             nn.TransformerEncoderLayer(
                 d_model=embed_dim,
@@ -48,20 +52,23 @@ class MaskedAutoEncoder(nn.Module):
                 dim_feedforward=int(embed_dim * mlp_ratio),
                 dropout=0.1,
                 batch_first=True,
-                norm_first=True
-            ) for _ in range(depth)
+                norm_first=True,
+            )
+            for _ in range(depth)
         ])
         self.encoder_norm = norm_layer(embed_dim)
         # --------------------------------------------------------------------------
-        
+
         # --------------------------------------------------------------------------
         # MAE decoder specifics
         self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim, bias=True)
-        
+
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
-        
-        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, seq_len + 1, decoder_embed_dim), requires_grad=False)  # fixed sin-cos embedding, +1 for cls token
-        
+
+        self.decoder_pos_embed = nn.Parameter(
+            torch.zeros(1, seq_len + 1, decoder_embed_dim), requires_grad=False
+        )  # fixed sin-cos embedding, +1 for cls token
+
         self.decoder_blocks = nn.ModuleList([
             nn.TransformerEncoderLayer(  # 使用Encoder作为Decoder
                 d_model=decoder_embed_dim,
@@ -69,14 +76,17 @@ class MaskedAutoEncoder(nn.Module):
                 dim_feedforward=int(decoder_embed_dim * mlp_ratio),
                 dropout=0.1,
                 batch_first=True,
-                norm_first=True
-            ) for _ in range(decoder_depth)
+                norm_first=True,
+            )
+            for _ in range(decoder_depth)
         ])
-        
+
         self.decoder_norm = norm_layer(decoder_embed_dim)
-        self.decoder_pred = nn.Linear(decoder_embed_dim, embed_dim, bias=True)  # decoder to original embedding
+        self.decoder_pred = nn.Linear(
+            decoder_embed_dim, embed_dim, bias=True
+        )  # decoder to original embedding
         # --------------------------------------------------------------------------
-        
+
         self.initialize_weights()
     
     def set_external_cls_token(self, P_L):
@@ -202,18 +212,23 @@ class MaskedAutoEncoder(nn.Module):
     
     def initialize_weights(self):
         # initialize position embeddings with sin-cos embedding
-        pos_embed = self.get_1d_sincos_pos_embed(self.embed_dim, self.seq_len, cls_token=True)
+        pos_embed = self.get_1d_sincos_pos_embed(
+            self.embed_dim, self.seq_len, cls_token=True
+        )
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
-        
-        decoder_pos_embed = self.get_1d_sincos_pos_embed(self.decoder_embed.out_features, self.seq_len, cls_token=True)
-        self.decoder_pos_embed.data.copy_(torch.from_numpy(decoder_pos_embed).float().unsqueeze(0))
-        
-        # initialize cls token
-        torch.nn.init.normal_(self.cls_token, std=.02)
-        
-        # initialize mask token
-        torch.nn.init.normal_(self.mask_token, std=.02)
-        
+
+        decoder_pos_embed = self.get_1d_sincos_pos_embed(
+            self.decoder_embed.out_features, self.seq_len, cls_token=True
+        )
+        self.decoder_pos_embed.data.copy_(
+            torch.from_numpy(decoder_pos_embed).float().unsqueeze(0)
+        )
+
+        # initialize tokens
+        torch.nn.init.normal_(self.cls_token, std=0.02)
+        torch.nn.init.normal_(self.mask_token, std=0.02)
+        torch.nn.init.normal_(self.encoder_mask_token, std=0.02)
+
         # initialize nn.Linear and nn.LayerNorm
         self.apply(self._init_weights)
     
@@ -517,30 +532,45 @@ class MaskedAutoEncoder(nn.Module):
             x_no_cls = x_encoded[:, 1:, :]  # [N, L, embed_dim]
             
             # 应用语义编码：[N, num_semantic_parts, L, embed_dim]
-            # 在推理时获取注意力权重信息
+            # 在推理时（非训练）先把mask的token添加回Encoder侧完整序列，再做语义嵌入并打印
             if not training:
-                semantic_enhanced, attention_weights = self.apply_semantic_encoding(x_no_cls, return_attention_weights=True)
+                # 1) 基于Encoder输出重建完整长度的序列（被mask位置用encoder_mask_token填充）
+                D_enc = x_encoded.shape[-1]
+                full_encoded = self.encoder_mask_token.repeat(N, original_length, 1).to(x_encoded.device)  # [N, L, D_enc]
                 
-                # 记录每个位置的最大权重语义表征序号
+                for i in range(N):
+                    # 有效的encoder token数量（不含cls）
+                    valid_len = int(keep_mask[i].sum().item() - 1)
+                    if valid_len > 0:
+                        ids_keep = ids_keep_list[i]
+                        # x_encoded中去掉cls后的前valid_len即为保留token的表示，顺序与ids_keep一致
+                        full_encoded[i, ids_keep, :] = x_encoded[i, 1:1 + valid_len, :]
+                
+                # 2) 在完整序列上进行语义嵌入，并拿到注意力权重
+                _, attention_weights = self.apply_semantic_encoding(full_encoded, return_attention_weights=True)
+                
+                # 3) 打印每个用户目的地序列的最大权重语义表征序号
                 if attention_weights is not None and uid is not None and destination_start_list is not None and destination_end_list is not None:
                     # attention_weights: [N, num_semantic_parts, L, 1]
-                    max_semantic_indices = torch.argmax(attention_weights.squeeze(-1), dim=1)  # [N, L]
-                    
-                    # 为每个样本打印目的地序列的最大语义表征序号
+                    max_semantic_indices_full = torch.argmax(attention_weights.squeeze(-1), dim=1)  # [N, L]
                     for i in range(N):
                         user_id = uid[i] if isinstance(uid[i], (int, str)) else uid[i].item()
-                        dest_start = destination_start_list[i]
-                        dest_end = destination_end_list[i]
-                        
+                        dest_start = int(destination_start_list[i])
+                        dest_end = int(destination_end_list[i])
                         if dest_end > dest_start:
-                            # 获取目的地序列的语义表征序号
-                            dest_semantic_indices = max_semantic_indices[i, dest_start:dest_end]
-                            dest_semantic_list = dest_semantic_indices.cpu().numpy().tolist()
-                            
+                            dest_semantic_indices = max_semantic_indices_full[i, dest_start:dest_end]
+                            dest_semantic_list = dest_semantic_indices.detach().cpu().tolist()
+                            # 统计分布（转为纯Python整数，避免打印设备信息）
+                            vals, cnts = torch.unique(dest_semantic_indices, return_counts=True)
+                            dist = {int(v.item()): int(c.item()) for v, c in zip(vals, cnts)}
                             print(f"[推理] 用户 {user_id} 的目的地序列语义表征序号: {dest_semantic_list}")
                             print(f"  - 目的地序列长度: {dest_end - dest_start}")
-                            print(f"  - 语义表征分布: {dict(zip(*torch.unique(dest_semantic_indices, return_counts=True)))}")
+                            print(f"  - 语义表征分布: {dist}")
+                
+                # 4) 解码阶段仍按原策略：在保留token上做语义嵌入
+                semantic_enhanced = self.apply_semantic_encoding(x_no_cls, return_attention_weights=False)
             else:
+                # 训练阶段：保持原行为，仅在保留token上做语义嵌入，不打印
                 semantic_enhanced = self.apply_semantic_encoding(x_no_cls, return_attention_weights=False)
             
             if semantic_enhanced is not None:
