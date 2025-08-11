@@ -520,7 +520,8 @@ class SPOTModel(nn.Module):
                 decoder_num_heads=n_head,
                 mlp_ratio=4.0,
                 num_semantic_parts=num_semantic_parts,
-                lambda_diversity=args.lambda_diversity
+                lambda_diversity=args.lambda_diversity,
+                lambda_attn_reg=args.lambda_attn_reg,
             )
 
         self.transformer_encoder = TransformerModel(embed_size=self.hidden_size * 2, nhead=n_head,

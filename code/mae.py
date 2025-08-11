@@ -12,13 +12,19 @@ class MaskedAutoEncoder(nn.Module):
     def __init__(self, seq_len=100, embed_dim=128, depth=6, num_heads=8,
                  decoder_embed_dim=128, decoder_depth=4, decoder_num_heads=8,
                  mlp_ratio=4., norm_layer=nn.LayerNorm, num_semantic_parts=8,
-                 lambda_diversity=0.1):
+                 lambda_diversity=0.1, lambda_attn_reg=0.1):
         super().__init__()
 
         self.seq_len = seq_len
         self.embed_dim = embed_dim
         self.num_semantic_parts = num_semantic_parts  # 语义部分数量
         self.lambda_diversity = lambda_diversity  # 语义多样性损失权重
+        # 注意力正则（熵正则 + 可选最大权重惩罚）
+        self.lambda_attn_reg = lambda_attn_reg
+        self.lambda_attn_max = 0.0
+        # 训练阶段缓存注意力用于正则
+        self._last_attention_weights = None
+        self._last_attention_valid_mask = None
 
         # --------------------------------------------------------------------------
         # MAE encoder specifics
@@ -558,7 +564,7 @@ class MaskedAutoEncoder(nn.Module):
                         dest_start = int(destination_start_list[i])
                         dest_end = int(destination_end_list[i])
                         if dest_end > dest_start:
-                            dest_semantic_indices = max_semantic_indices_full[i, dest_start:dest_end]
+                            dest_semantic_indices = max_semantic_indices_full[i, dest_start:dest_end + 1]
                             dest_semantic_list = dest_semantic_indices.detach().cpu().tolist()
                             # 统计分布（转为纯Python整数，避免打印设备信息）
                             vals, cnts = torch.unique(dest_semantic_indices, return_counts=True)
@@ -570,8 +576,12 @@ class MaskedAutoEncoder(nn.Module):
                 # 4) 解码阶段仍按原策略：在保留token上做语义嵌入
                 semantic_enhanced = self.apply_semantic_encoding(x_no_cls, return_attention_weights=False)
             else:
-                # 训练阶段：保持原行为，仅在保留token上做语义嵌入，不打印
-                semantic_enhanced = self.apply_semantic_encoding(x_no_cls, return_attention_weights=False)
+                # 训练阶段：在保留token上做语义嵌入，并缓存注意力用于正则
+                semantic_enhanced, attention_weights = self.apply_semantic_encoding(
+                    x_no_cls, return_attention_weights=True
+                )
+                self._last_attention_weights = attention_weights  # [N, P, L_keep, 1]
+                self._last_attention_valid_mask = keep_mask[:, 1:]  # [N, L_keep]
             
             if semantic_enhanced is not None:
                 # 对每个语义部分分别进行decoder处理
@@ -594,8 +604,11 @@ class MaskedAutoEncoder(nn.Module):
                 # 归一化相加所有语义部分的输出：[N, L, embed_dim]
                 final_output = torch.stack(semantic_outputs, dim=0).mean(dim=0)
                 return final_output
-        
+
         # 如果没有语义编码，使用原始decoder
+        # 清空正则缓存，防止沿用上一批次
+        self._last_attention_weights = None
+        self._last_attention_valid_mask = None
         return self._decode_single_semantic(x_encoded, ids_keep_list, ids_restore_list, keep_mask, original_length)
     
     def _decode_single_semantic(self, x_encoded, ids_keep_list, ids_restore_list, keep_mask, original_length):
@@ -621,7 +634,9 @@ class MaskedAutoEncoder(nn.Module):
             # Calculate number of mask tokens needed
             num_mask_tokens = original_length - len(ids_keep)
             if num_mask_tokens > 0:
-                mask_tokens = self.mask_token.repeat(1, num_mask_tokens, 1).squeeze(0)  # [num_mask, D]
+                # Fill masked positions with the decoder-embedded CLS token
+                cls_dec = x[i, :1, :]  # [1, D]
+                mask_tokens = cls_dec.repeat(num_mask_tokens, 1)  # [num_mask, D]
             else:
                 mask_tokens = torch.empty(0, self.mask_token.shape[-1], device=x.device)
             
@@ -684,26 +699,29 @@ class MaskedAutoEncoder(nn.Module):
         """
         if valid_mask is None:
             valid_mask = torch.ones_like(mask, dtype=torch.bool)
-        
+
         # Only compute loss on masked AND valid positions
         loss_mask = mask & valid_mask  # [N, L]
-        
+
         if loss_mask.sum() == 0:
             return torch.tensor(0.0, device=original.device)
-        
-        # Compute MSE loss
+
+        # Compute MSE loss per position
         mse_loss = F.mse_loss(pred, original, reduction='none')  # [N, L, D]
-        mse_loss = mse_loss.mean(dim=-1)  # [N, L], mean loss per position
-        
-        # Apply mask and compute mean loss on masked positions
+        mse_loss = mse_loss.mean(dim=-1)  # [N, L]
+
+        # Reconstruction loss over masked valid positions
         reconstruction_loss = (mse_loss * loss_mask.float()).sum() / loss_mask.sum()
-        
-        # 计算语义多样性损失（如果启用了语义编码）
+
+        # Semantic diversity loss (if enabled)
         diversity_loss = self.compute_semantic_diversity_loss()
-        
-        # 总损失
-        total_loss = reconstruction_loss + diversity_loss
-        
+
+        # Attention distribution regularization (training caches it)
+        attn_reg_loss = self.compute_attention_reg_loss()
+
+        # Total loss
+        total_loss = reconstruction_loss + diversity_loss + attn_reg_loss
+
         return total_loss
     
     def forward_loss_detailed(self, original, pred, mask, valid_mask=None):
@@ -722,12 +740,16 @@ class MaskedAutoEncoder(nn.Module):
         
         # Only compute loss on masked AND valid positions
         loss_mask = mask & valid_mask  # [N, L]
-        
+
         if loss_mask.sum() == 0:
             return {
                 'total_loss': torch.tensor(0.0, device=original.device),
                 'reconstruction_loss': torch.tensor(0.0, device=original.device),
-                'diversity_loss': torch.tensor(0.0, device=original.device)
+                'diversity_loss': torch.tensor(0.0, device=original.device),
+                'diversity_weight': self.lambda_diversity,
+                'attention_reg_loss': torch.tensor(0.0, device=original.device),
+                'attention_reg_weight': self.lambda_attn_reg,
+                'attention_max_weight': self.lambda_attn_max
             }
         
         # Compute MSE loss
@@ -739,15 +761,21 @@ class MaskedAutoEncoder(nn.Module):
         
         # 计算语义多样性损失（如果启用了语义编码）
         diversity_loss = self.compute_semantic_diversity_loss()
+
+        # 注意力分布正则（训练阶段才会缓存注意力）
+        attn_reg_loss = self.compute_attention_reg_loss()
         
         # 总损失
-        total_loss = reconstruction_loss + diversity_loss
+        total_loss = reconstruction_loss + diversity_loss + attn_reg_loss
         
         return {
             'total_loss': total_loss,
             'reconstruction_loss': reconstruction_loss,
             'diversity_loss': diversity_loss,
-            'diversity_weight': self.lambda_diversity
+            'diversity_weight': self.lambda_diversity,
+            'attention_reg_loss': attn_reg_loss,
+            'attention_reg_weight': self.lambda_attn_reg,
+            'attention_max_weight': self.lambda_attn_max
         }
     
     def compute_semantic_diversity_loss(self):
@@ -778,14 +806,56 @@ class MaskedAutoEncoder(nn.Module):
         # 只保留上三角部分（不包括对角线），避免重复计算
         upper_triangle_similarities = cosine_matrix[:, mask]  # [N, num_pairs]
         
-        # 计算平均余弦相似度
-        average_cosine_similarity = upper_triangle_similarities.mean()
+        # 计算平均余弦相似度的平方，避免通过负相关“取巧”
+        average_cosine_similarity = upper_triangle_similarities.pow(2).mean()
         
         # 多样性损失：我们希望余弦相似度尽可能小（表征尽可能不同）
         # 因此损失为相似度的平均值，乘以权重系数
         diversity_loss = self.lambda_diversity * average_cosine_similarity
         
         return diversity_loss
+
+    def compute_attention_reg_loss(self):
+        """
+        基于注意力分布的正则：
+        - 熵正则：鼓励在语义部分维度上的分布更均匀（更高的熵）
+        - 可选最大权重惩罚：抑制单一语义部分的过大权重
+        Returns: 标量损失（已乘以对应权重）
+        """
+        if self._last_attention_weights is None:
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+
+        attn = self._last_attention_weights  # [N, P, L, 1]
+        attn = attn.squeeze(-1)  # [N, P, L]
+
+        if self._last_attention_valid_mask is None:
+            valid_mask = torch.ones(attn.shape[0], attn.shape[-1], dtype=torch.bool, device=attn.device)
+        else:
+            valid_mask = self._last_attention_valid_mask  # [N, L]
+
+        # 熵正则（按语义部分维度）
+        eps = 1e-8
+        # 熵：-sum p log p；对P做归一化，使最大熵为1
+        entropy = -(attn * (attn + eps).log()).sum(dim=1)  # [N, L]
+        P = attn.shape[1]
+        max_entropy = torch.log(torch.tensor(float(P), device=attn.device))
+        normalized_entropy = entropy / (max_entropy + eps)  # [N, L]
+
+        # 仅在有效位置上取平均
+        valid_float = valid_mask.float()
+        entropy_mean = (normalized_entropy * valid_float).sum() / (valid_float.sum() + eps)
+
+        # 损失希望熵越高越好 => loss = 1 - 平均熵
+        entropy_reg = self.lambda_attn_reg * (1.0 - entropy_mean)
+
+        # 最大权重惩罚（可选）
+        max_w = attn.max(dim=1).values  # [N, L]
+        target = 1.0 / float(P)
+        max_penalty = ((max_w - target).clamp(min=0.0) ** 2)
+        max_penalty_mean = (max_penalty * valid_float).sum() / (valid_float.sum() + eps)
+        max_reg = self.lambda_attn_max * max_penalty_mean
+
+        return entropy_reg + max_reg
     
     def forward(self, x, uid, mask_ratio=0.75, mask_lambda=1.0, hometown_len_list=None, destination_start_list=None,
                destination_end_list=None, valid_mask=None, training=True, use_semantic_masking=True):
@@ -813,6 +883,13 @@ class MaskedAutoEncoder(nn.Module):
         当 num_semantic_parts = 0 时，使用标准的MAE流程（无语义增强，无多样性损失）
         当 num_semantic_parts <= 1 时，不计算多样性损失
         """
+        # 在每次前向前重算语义表征，保证语义投影层的梯度链路有效
+        if self.num_semantic_parts > 0 and self.external_cls_token is not None:
+            # self.external_cls_token: [N, 1, D] -> [N, D]
+            P_L_current = self.external_cls_token.squeeze(1)
+            # 根据当前批次的外部CLS重新生成语义部分
+            self._generate_semantic_parts(P_L_current)
+
         original_length = x.shape[1]
         
         # Encoder
