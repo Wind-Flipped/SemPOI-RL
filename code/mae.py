@@ -51,6 +51,12 @@ class MaskedAutoEncoder(nn.Module):
             # 用于生成注意力权重的线性层
             self.semantic_attention_layer = nn.Linear(embed_dim, 1)
 
+            # Cross-Attention 投影层（Q 来自 encoder_output，K/V 来自 semantic_parts_embedding）
+            self.semantic_q = nn.Linear(embed_dim, embed_dim, bias=True)
+            self.semantic_k = nn.Linear(embed_dim, embed_dim, bias=True)
+            self.semantic_v = nn.Linear(embed_dim, embed_dim, bias=True)
+            self.semantic_out = nn.Linear(embed_dim, embed_dim, bias=True)
+
         self.encoder_blocks = nn.ModuleList([
             nn.TransformerEncoderLayer(
                 d_model=embed_dim,
@@ -161,44 +167,43 @@ class MaskedAutoEncoder(nn.Module):
     
     def apply_semantic_encoding(self, encoder_output, return_attention_weights=False):
         """
-        将语义表征与encoder输出结合
-        Args:
-            encoder_output: [N, L, embed_dim] encoder的输出表征
-            return_attention_weights: bool, 是否返回注意力权重信息
-        Returns:
-            semantic_enhanced_output: [N, num_semantic_parts, L, embed_dim] 语义增强的表征
-            attention_weights: (optional) [N, num_semantic_parts, L, 1] 注意力权重
+        使用 Cross-Attention 将语义表征与 Encoder 输出结合。
+        - 语义部分 embedding（[N, P, D]）作为 Key/Value
+        - Encoder 输出（[N, L, D]）作为 Query
+        返回：
+            semantic_enhanced: [N, L, D]
+            attention_weights (可选): [N, P, L, 1]，在语义部分维度上的注意力分布
         """
         if self.num_semantic_parts == 0 or self.semantic_parts_embedding is None:
             if return_attention_weights:
                 return None, None
             else:
                 return None
-            
+
         N, L, D = encoder_output.shape
-        # semantic_parts_embedding: [N, num_semantic_parts, embed_dim]
-        
-        # 扩展语义表征到所有位置：[N, num_semantic_parts, L, embed_dim]
-        semantic_expanded = self.semantic_parts_embedding.unsqueeze(2).expand(-1, -1, L, -1)
-        
-        # 扩展encoder输出到所有语义部分：[N, num_semantic_parts, L, embed_dim]
-        encoder_expanded = encoder_output.unsqueeze(1).expand(-1, self.num_semantic_parts, -1, -1)
-        
-        # 拼接语义表征和encoder输出：[N, num_semantic_parts, L, 2*embed_dim]
-        combined = torch.cat([semantic_expanded, encoder_expanded], dim=-1)
-        
-        # 通过线性层融合：[N, num_semantic_parts, L, embed_dim]
-        fused = self.semantic_fusion_layer(combined)
-        
-        # 应用注意力机制生成权重
-        attention_scores = self.semantic_attention_layer(fused)  # [N, num_semantic_parts, L, 1]
-        attention_weights = torch.softmax(attention_scores, dim=1)  # 在语义部分维度上softmax
-        
-        # 加权融合：[N, num_semantic_parts, L, embed_dim]
-        semantic_enhanced = fused * attention_weights
-        
+        P = self.num_semantic_parts
+
+        # 线性投影到 Q/K/V 空间
+        # Q: [N, L, D], K: [N, P, D], V: [N, P, D]
+        Q = self.semantic_q(encoder_output)
+        K = self.semantic_k(self.semantic_parts_embedding)
+        V = self.semantic_v(self.semantic_parts_embedding)
+
+        # 注意力分数：Q @ K^T / sqrt(D)
+        # QK^T: [N, L, P]
+        scale = D ** 0.5
+        attn_logits = torch.matmul(Q, K.transpose(1, 2)) / scale  # [N, L, P]
+        attn = torch.softmax(attn_logits, dim=-1)  # 在语义部分维度上 softmax
+
+        # 上述注意力权重用于 introspection/正则：格式化为 [N, P, L, 1]
+        attn_for_return = attn.permute(0, 2, 1).unsqueeze(-1)  # [N, P, L, 1]
+
+        # 加权求和得到 cross-attended 表征: [N, L, D]
+        semantic_context = torch.matmul(attn, V)  # [N, L, D]
+        semantic_enhanced = self.semantic_out(semantic_context) + encoder_output  # 残差连接
+
         if return_attention_weights:
-            return semantic_enhanced, attention_weights
+            return semantic_enhanced, attn_for_return
         else:
             return semantic_enhanced
     
@@ -237,6 +242,18 @@ class MaskedAutoEncoder(nn.Module):
 
         # initialize nn.Linear and nn.LayerNorm
         self.apply(self._init_weights)
+
+        # For semantic projection layers (W_c1/W_c2), use a slightly larger random init variance
+        if self.num_semantic_parts > 0:
+            std = 0.1  # larger than default 0.02 to add variability
+            for lin in self.semantic_W_c1_list:
+                nn.init.normal_(lin.weight, mean=0.0, std=std)
+                if lin.bias is not None:
+                    nn.init.zeros_(lin.bias)
+            for lin in self.semantic_W_c2_list:
+                nn.init.normal_(lin.weight, mean=0.0, std=std)
+                if lin.bias is not None:
+                    nn.init.zeros_(lin.bias)
     
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -246,6 +263,7 @@ class MaskedAutoEncoder(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
+
     
     def get_1d_sincos_pos_embed(self, embed_dim, seq_len, cls_token=False, temperature=10000.):
         """
@@ -537,7 +555,7 @@ class MaskedAutoEncoder(nn.Module):
             # 移除cls token进行语义增强
             x_no_cls = x_encoded[:, 1:, :]  # [N, L, embed_dim]
             
-            # 应用语义编码：[N, num_semantic_parts, L, embed_dim]
+            # 应用语义编码（在语义融合前加入位置编码，使不同位置有不同语义表征）
             # 在推理时（非训练）先把mask的token添加回Encoder侧完整序列，再做语义嵌入并打印
             if not training:
                 # 1) 基于Encoder输出重建完整长度的序列（被mask位置用encoder_mask_token填充）
@@ -552,7 +570,10 @@ class MaskedAutoEncoder(nn.Module):
                         # x_encoded中去掉cls后的前valid_len即为保留token的表示，顺序与ids_keep一致
                         full_encoded[i, ids_keep, :] = x_encoded[i, 1:1 + valid_len, :]
                 
-                # 2) 在完整序列上进行语义嵌入，并拿到注意力权重
+                # 2) 在完整序列上加入 decoder 位置编码（若维度匹配），再进行语义嵌入，并拿到注意力权重
+                if full_encoded.shape[-1] == self.decoder_pos_embed.shape[-1]:
+                    pos_full = self.decoder_pos_embed[:, 1:original_length + 1, :].to(full_encoded.device)
+                    full_encoded = full_encoded + pos_full
                 _, attention_weights = self.apply_semantic_encoding(full_encoded, return_attention_weights=True)
                 
                 # 3) 打印每个用户目的地序列的最大权重语义表征序号
@@ -570,39 +591,36 @@ class MaskedAutoEncoder(nn.Module):
                             vals, cnts = torch.unique(dest_semantic_indices, return_counts=True)
                             dist = {int(v.item()): int(c.item()) for v, c in zip(vals, cnts)}
                             print(f"[推理] 用户 {user_id} 的目的地序列语义表征序号: {dest_semantic_list}")
-                            print(f"  - 目的地序列长度: {dest_end - dest_start}")
+                            print(f"  - 目的地序列长度: {dest_end - dest_start + 1}")
                             print(f"  - 语义表征分布: {dist}")
                 
-                # 4) 解码阶段仍按原策略：在保留token上做语义嵌入
-                semantic_enhanced = self.apply_semantic_encoding(x_no_cls, return_attention_weights=False)
+                # 4) 解码阶段：在保留token上加入 decoder 位置编码（若维度匹配）后做语义嵌入
+                x_no_cls_for_sem = x_no_cls
+                if x_no_cls.shape[-1] == self.decoder_pos_embed.shape[-1]:
+                    L_keep = x_no_cls.shape[1]
+                    pos_keep = self.decoder_pos_embed[:, 1:L_keep + 1, :].to(x_no_cls.device)
+                    x_no_cls_for_sem = x_no_cls + pos_keep
+                semantic_enhanced = self.apply_semantic_encoding(x_no_cls_for_sem, return_attention_weights=False)
             else:
                 # 训练阶段：在保留token上做语义嵌入，并缓存注意力用于正则
+                x_no_cls_for_sem = x_no_cls
+                if x_no_cls.shape[-1] == self.decoder_pos_embed.shape[-1]:
+                    L_keep = x_no_cls.shape[1]
+                    pos_keep = self.decoder_pos_embed[:, 1:L_keep + 1, :].to(x_no_cls.device)
+                    x_no_cls_for_sem = x_no_cls + pos_keep
                 semantic_enhanced, attention_weights = self.apply_semantic_encoding(
-                    x_no_cls, return_attention_weights=True
+                    x_no_cls_for_sem, return_attention_weights=True
                 )
                 self._last_attention_weights = attention_weights  # [N, P, L_keep, 1]
                 self._last_attention_valid_mask = keep_mask[:, 1:]  # [N, L_keep]
             
             if semantic_enhanced is not None:
-                # 对每个语义部分分别进行decoder处理
-                semantic_outputs = []
-                
-                for part_idx in range(self.num_semantic_parts):
-                    # 取出当前语义部分的表征：[N, L, embed_dim]
-                    current_semantic = semantic_enhanced[:, part_idx, :, :]
-                    
-                    # 重新添加cls token
-                    cls_tokens = x_encoded[:, :1, :]  # [N, 1, embed_dim]
-                    current_with_cls = torch.cat([cls_tokens, current_semantic], dim=1)
-                    
-                    # 进行decoder处理
-                    decoded_part = self._decode_single_semantic(
-                        current_with_cls, ids_keep_list, ids_restore_list, keep_mask, original_length
-                    )
-                    semantic_outputs.append(decoded_part)
-                
-                # 归一化相加所有语义部分的输出：[N, L, embed_dim]
-                final_output = torch.stack(semantic_outputs, dim=0).mean(dim=0)
+                # 单次解码：将 cross-attended 的语义增强表示与 CLS 拼接后送入解码器
+                cls_tokens = x_encoded[:, :1, :]  # [N, 1, embed_dim]
+                current_with_cls = torch.cat([cls_tokens, semantic_enhanced], dim=1)
+                final_output = self._decode_single_semantic(
+                    current_with_cls, ids_keep_list, ids_restore_list, keep_mask, original_length
+                )
                 return final_output
 
         # 如果没有语义编码，使用原始decoder
@@ -667,13 +685,7 @@ class MaskedAutoEncoder(nn.Module):
         cls_tokens = x[:, :1, :]  # [N, 1, D] - keep cls token from encoder
         x_full = torch.cat([cls_tokens, x_full], dim=1)  # [N, L+1, D]
         
-        # Add pos embed
-        if x_full.shape[1] <= self.decoder_pos_embed.shape[1]:
-            x_full = x_full + self.decoder_pos_embed[:, :x_full.shape[1], :]
-        else:
-            # Handle sequences longer than expected
-            pos_embed_extended = self.decoder_pos_embed.repeat(1, (x_full.shape[1] // self.decoder_pos_embed.shape[1]) + 1, 1)
-            x_full = x_full + pos_embed_extended[:, :x_full.shape[1], :]
+    # 位置编码在语义融合前已加入，这里不再添加 decoder_pos_embed
         
         # Apply Transformer blocks (using Encoder as Decoder)
         for blk in self.decoder_blocks:
