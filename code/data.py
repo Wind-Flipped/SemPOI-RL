@@ -13,6 +13,7 @@ import json
 import os
 import pickle
 from collections import Counter
+
 try:
     import ipdb
 except ImportError:
@@ -636,11 +637,111 @@ def create_travel_text_dataset(args, dataset_name):
     return TravelTextDataset(args, home_path, oot_path, travel_path)
 
 
-if __name__ == '__main__':
-    args = type('', (), {})()  # 创建一个空对象作为args
-    args.dataset_name = 'Yelp'
+def extract_and_save_poi_metadata(dataset_name):
+    """\
+    提取每个数字 POI id 对应的元信息 (原始字符串 bid, 纬度, 经度, 所在城市 / 区域, 类别) 并保存。
 
-    travel_dataset = TravelTextDataset(args, f'../{args.dataset_name}/home.txt', f'../{args.dataset_name}/oot.txt', f'../{args.dataset_name}/travel.txt')
-    text_pairs = travel_dataset.generate_json()
-    with open(f'../data/{args.dataset_name}.json', 'w') as f:
-        json.dump(text_pairs, f)
+    数据来源:
+      - ../{dataset_name}/home.txt  与  ../{dataset_name}/oot.txt
+        行格式: uid\tcuid\trid\tbid\ttimestamp\tstd_tag
+      - ../{dataset_name}/poi_id.pkl : 原始 bid -> 数字 POI id 的映射
+      - ../{dataset_name}/poi_coord.pkl : 数字 POI id -> (lat, lon)
+
+    产出文件:
+      - ../{dataset_name}/poi_meta.pkl  (dict)
+      - ../{dataset_name}/poi_meta.json (UTF-8 JSON, 便于查看)
+
+    每个 POI 的结构示例:
+      poi_meta[num_id] = {
+          'bid': 'original_string_id',
+          'lat': 31.2345,
+          'lon': 121.4567,
+          'regions': ['shanghai'],            # 出现过的所有区域 (去重)
+          'categories': ['Food', 'Coffee'],    # 出现过的所有类别 (去重)
+          'main_region': 'shanghai',          # 最频繁区域
+          'main_category': 'Food'             # 最频繁类别
+      }
+    """
+    import pickle, json, os
+    from collections import defaultdict, Counter
+
+    base_dir = f"../{dataset_name}"
+    home_path = os.path.join(base_dir, 'home.txt')
+    oot_path = os.path.join(base_dir, 'oot.txt')
+    poi_id_path = os.path.join(base_dir, 'poi_id.pkl')
+    poi_coord_path = os.path.join(base_dir, 'poi_coord.pkl')
+
+    # 读取必要的映射文件
+    if not (os.path.exists(poi_id_path) and os.path.exists(poi_coord_path)):
+        raise FileNotFoundError("需要先生成 poi_id.pkl 与 poi_coord.pkl")
+    with open(poi_id_path, 'rb') as f:
+        bid2num = pickle.load(f)  # 原始 bid -> 数字 id
+    # 反向映射: 数字 id -> 原始 bid
+    num2bid = {v: k for k, v in bid2num.items()}
+    with open(poi_coord_path, 'rb') as f:
+        numid2coord = pickle.load(f)  # 数字 id -> (lat, lon)
+
+    # 读取轨迹文本 (home + oot)
+    def _read_lines(p):
+        if not os.path.exists(p):
+            return []
+        with open(p, 'r', encoding='utf-8') as f:
+            return [ln.strip().split('\t') for ln in f if ln.strip()]
+
+    all_rows = _read_lines(home_path) + _read_lines(oot_path)
+
+    # 汇总 region / category
+    region_counter = defaultdict(Counter)   # num_id -> Counter(region)
+    category_counter = defaultdict(Counter) # num_id -> Counter(category)
+
+    for row in all_rows:
+        if len(row) < 6:
+            continue
+        uid, cuid, rid, bid, ts, std_tag = row
+        num_id = bid2num.get(bid)
+        if num_id is None:
+            continue
+        region_counter[num_id][rid] += 1
+        category_counter[num_id][std_tag] += 1
+
+    poi_meta = {}
+    for num_id, coord in numid2coord.items():
+        lat, lon = coord if isinstance(coord, (list, tuple)) and len(coord) >= 2 else (0.0, 0.0)
+        regions = list(region_counter[num_id].keys()) if num_id in region_counter else []
+        categories = list(category_counter[num_id].keys()) if num_id in category_counter else []
+        main_region = region_counter[num_id].most_common(1)[0][0] if region_counter[num_id] else None
+        main_category = category_counter[num_id].most_common(1)[0][0] if category_counter[num_id] else None
+        poi_meta[num_id] = {
+            'bid': num2bid.get(num_id, None),
+            'lat': float(lat),
+            'lon': float(lon),
+            'regions': regions,
+            'categories': categories,
+            'main_region': main_region,
+            'main_category': main_category
+        }
+
+    # 保存
+    meta_pkl = os.path.join(base_dir, 'poi_meta.pkl')
+    meta_json = os.path.join(base_dir, 'poi_meta.json')
+    with open(meta_pkl, 'wb') as f:
+        pickle.dump(poi_meta, f)
+    # JSON 需要可序列化 key -> 转成字符串 key
+    json_serializable = {int(k): v for k, v in poi_meta.items()}
+    with open(meta_json, 'w', encoding='utf-8') as f:
+        json.dump(json_serializable, f, ensure_ascii=False, indent=2)
+
+    return poi_meta
+
+
+if __name__ == '__main__':
+    # args = type('', (), {})()  # 创建一个空对象作为args
+    # args.dataset_name = 'Yelp'
+
+    # travel_dataset = TravelTextDataset(args, f'../{args.dataset_name}/home.txt', f'../{args.dataset_name}/oot.txt', f'../{args.dataset_name}/travel.txt')
+    # text_pairs = travel_dataset.generate_json()
+    # with open(f'../data/{args.dataset_name}.json', 'w') as f:
+    #     json.dump(text_pairs, f)
+    dataset_name = 'Yelp'
+    poi_meta = extract_and_save_poi_metadata(dataset_name)
+    print(f"提取并保存了 {len(poi_meta)} 个 POI 的元信息")

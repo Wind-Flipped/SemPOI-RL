@@ -211,6 +211,14 @@ def train_single_phase(model, train_loader, valid_loader, test_loader, args, log
     text_dataset = load_from_disk(args.dataset_path)
     prompts, references = [item['prompt'] for item in text_dataset], [item['reference'] for item in text_dataset]
 
+    # 读取 POI 元信息 (用于地理 / 类别 / 区域指标)
+    poi_meta = None
+    try:
+        with open(f'../{args.dataset_name}/poi_meta.pkl', 'rb') as f:
+            poi_meta = pickle.load(f)
+    except Exception as _e:
+        logger.log(f"[warn] 无法加载 poi_meta.pkl: {_e}")
+
     for e in range(args.epoch):
         # pre-training
         if args.kg and args.train_trans and args.model == 'SPOT-Trip':
@@ -277,6 +285,26 @@ def train_single_phase(model, train_loader, valid_loader, test_loader, args, log
             batch_alt_pairs_f1 = []
             batch_alt_all_f1 = []
             batch_alt_pairs_all_f1 = []
+            # 新指标收集
+            batch_hit = []
+            batch_recall = []
+            batch_lev = []
+            batch_dtw = []
+            batch_geo = []
+            batch_cat = []
+            batch_region = []
+            batch_path_err = []
+            batch_centroid = []
+            # full 序列
+            full_hit = []
+            full_recall = []
+            full_lev = []
+            full_dtw = []
+            full_geo = []
+            full_cat = []
+            full_region = []
+            full_path_err = []
+            full_centroid = []
 
             for b, (uid, o_ck, d_ck, masked_d_ck, o_h, d_h, masked_d_h, o_t, d_t, o_l, d_l, o_pad, d_pad, o_rg,
                     d_rg) in enumerate(valid_loader):
@@ -347,14 +375,82 @@ def train_single_phase(model, train_loader, valid_loader, test_loader, args, log
                     batch_alt_all_f1.append(full_sample_f1)
                     batch_alt_pairs_all_f1.append(full_sample_pairs_f1)
 
+                    # 计算新增指标 （包括首尾）
+                    inner_pred = sample_pred[1:-1]
+                    inner_target = sample_target[1:-1]
+                    # 中间序列指标
+                    if inner_target.numel() > 0:
+                        try:
+                            batch_hit.append(metrics.hit_rate(inner_pred, inner_target))
+                            batch_recall.append(metrics.recall_rate(inner_pred, inner_target, unique=True))
+                            batch_lev.append(metrics.levenshtein_distance(inner_pred, inner_target, normalize=True))
+                            batch_dtw.append(metrics.dtw_distance(inner_pred, inner_target, normalize=True))
+                            if poi_meta:
+                                geo_err = metrics.average_geo_distance_error(inner_pred, inner_target, poi_meta)
+                                cat_cons = metrics.category_consistency_rate(inner_pred, inner_target, poi_meta)
+                                reg_match = metrics.region_match_rate(inner_pred, inner_target, poi_meta)
+                                path_err = metrics.relative_path_distance_error(inner_pred, inner_target, poi_meta, normalize=True)
+                                centroid_dist = metrics.centroid_geo_distance(inner_pred, inner_target, poi_meta)
+                                if not np.isnan(geo_err): batch_geo.append(geo_err)
+                                if not np.isnan(cat_cons): batch_cat.append(cat_cons)
+                                if not np.isnan(reg_match): batch_region.append(reg_match)
+                                if not np.isnan(path_err): batch_path_err.append(path_err)
+                                if not np.isnan(centroid_dist): batch_centroid.append(centroid_dist)
+                        except Exception as _me:
+                            logger.log(f"[warn] metric calc error(inner): {_me}")
+                    # full 序列指标 (包含首尾)
+                    try:
+                        # 使用 alt_sample_pred 计算包含首尾的 full-* 指标
+                        full_hit.append(metrics.hit_rate(alt_sample_pred, sample_target))
+                        full_recall.append(metrics.recall_rate(alt_sample_pred, sample_target, unique=True))
+                        full_lev.append(metrics.levenshtein_distance(alt_sample_pred, sample_target, normalize=True))
+                        full_dtw.append(metrics.dtw_distance(alt_sample_pred, sample_target, normalize=True))
+                        if poi_meta:
+                            g2 = metrics.average_geo_distance_error(alt_sample_pred, sample_target, poi_meta)
+                            c2 = metrics.category_consistency_rate(alt_sample_pred, sample_target, poi_meta)
+                            r2 = metrics.region_match_rate(alt_sample_pred, sample_target, poi_meta)
+                            p2 = metrics.relative_path_distance_error(alt_sample_pred, sample_target, poi_meta, normalize=True)
+                            cent2 = metrics.centroid_geo_distance(alt_sample_pred, sample_target, poi_meta)
+                            if not np.isnan(g2): full_geo.append(g2)
+                            if not np.isnan(c2): full_cat.append(c2)
+                            if not np.isnan(r2): full_region.append(r2)
+                            if not np.isnan(p2): full_path_err.append(p2)
+                            if not np.isnan(cent2): full_centroid.append(cent2)
+                    except Exception as _me:
+                        logger.log(f"[warn] metric calc error(full): {_me}")
+
             alt_f1 = np.mean(batch_alt_f1)
             alt_pairs_f1 = np.mean(batch_alt_pairs_f1)
             alt_all_f1 = np.mean(batch_alt_all_f1)
             alt_pairs_all_f1 = np.mean(batch_alt_pairs_all_f1)
-            logger.log("[val] Epoch {}/{} F1-Score: {:5.4f} Pairs-F1-Score: {:5.4f}. All-F1-Score: {:5.4f} All-Pairs-F1-Score: {:5.4f}." \
-                       .format(e, args.epoch - 1, alt_f1, alt_pairs_f1, alt_all_f1, alt_pairs_all_f1))
+            # 新指标聚合
+            hit_mean = np.mean(batch_hit) if batch_hit else float('nan')
+            recall_mean = np.mean(batch_recall) if batch_recall else float('nan')
+            lev_mean = np.mean(batch_lev) if batch_lev else float('nan')
+            dtw_mean = np.mean(batch_dtw) if batch_dtw else float('nan')
+            geo_mean = np.mean(batch_geo) if batch_geo else float('nan')
+            cat_mean = np.mean(batch_cat) if batch_cat else float('nan')
 
-        get_test_result(model, test_loader, args, logger, prompts, references)
+            region_mean = np.mean(batch_region) if batch_region else float('nan')
+            path_err_mean = np.mean(batch_path_err) if batch_path_err else float('nan')
+            centroid_mean = np.mean(batch_centroid) if batch_centroid else float('nan')
+
+            # full metrics
+            full_hit_mean = np.mean(full_hit) if full_hit else float('nan')
+            full_recall_mean = np.mean(full_recall) if full_recall else float('nan')
+            full_lev_mean = np.mean(full_lev) if full_lev else float('nan')
+            full_dtw_mean = np.mean(full_dtw) if full_dtw else float('nan')
+            full_geo_mean = np.mean(full_geo) if full_geo else float('nan')
+            full_cat_mean = np.mean(full_cat) if full_cat else float('nan')
+            full_region_mean = np.mean(full_region) if full_region else float('nan')
+            full_path_err_mean = np.mean(full_path_err) if full_path_err else float('nan')
+            full_centroid_mean = np.mean(full_centroid) if full_centroid else float('nan')
+
+            logger.log("[val] Epoch {}/{} F1: {:5.4f} Pairs-F1: {:5.4f} All-F1: {:5.4f} All-Pairs-F1: {:5.4f} | Hit: {} Recall: {} Lev: {} DTW: {} Geo: {} Cat: {} Region: {} PathErr: {} Centroid(km): {} | full-Hit: {} full-Recall: {} full-Lev: {} full-DTW: {} full-Geo: {} full-Cat: {} full-Region: {} full-PathErr: {} full-Centroid(km): {}".format(
+                e, args.epoch - 1, alt_f1, alt_pairs_f1, alt_all_f1, alt_pairs_all_f1,
+                _fmt(hit_mean), _fmt(recall_mean), _fmt(lev_mean), _fmt(dtw_mean), _fmt(geo_mean), _fmt(cat_mean), _fmt(region_mean), _fmt(path_err_mean), _fmt(centroid_mean),
+                _fmt(full_hit_mean), _fmt(full_recall_mean), _fmt(full_lev_mean), _fmt(full_dtw_mean), _fmt(full_geo_mean), _fmt(full_cat_mean), _fmt(full_region_mean), _fmt(full_path_err_mean), _fmt(full_centroid_mean)))
+        get_test_result(model, test_loader, args, logger, prompts, references, poi_meta)
 
         # early stop
         if flag:
@@ -390,13 +486,42 @@ def train_single_phase(model, train_loader, valid_loader, test_loader, args, log
             else:
                 return best_return
 
-def get_test_result(model, test_loader, args, logger, prompts, references):
+def _fmt(v):
+    if v is None: return 'None'
+    if isinstance(v, numbers.Number):
+        if np.isnan(v):
+            return 'nan'
+        return f"{v:.4f}"
+    return str(v)
+
+
+def get_test_result(model, test_loader, args, logger, prompts, references, poi_meta=None):
     batch_alt_f1 = []
     batch_alt_pairs_f1 = []
     batch_alt_all_f1 = []
     batch_alt_pairs_all_f1 = []
     # for the repetition
     repetition_list = []
+    # 新指标收集
+    batch_hit = []
+    batch_recall = []
+    batch_lev = []
+    batch_dtw = []
+    batch_geo = []
+    batch_cat = []
+    batch_region = []
+    batch_path_err = []
+    batch_centroid = []
+    full_hit = []
+    full_recall = []
+    full_lev = []
+    full_dtw = []
+    full_geo = []
+    full_cat = []
+    full_region = []
+    full_path_err = []
+    full_centroid = []
+
     for b, (uid, o_ck, d_ck, masked_d_ck, o_h, d_h, masked_d_h, o_t, d_t, o_l, d_l, o_pad, d_pad, o_rg, d_rg) in tqdm(
             enumerate(test_loader), total=len(test_loader.dataset) / args.test_batch):
         if args.use_target_llm:
@@ -459,15 +584,77 @@ def get_test_result(model, test_loader, args, logger, prompts, references):
             batch_alt_all_f1.append(full_sample_f1)
             batch_alt_pairs_all_f1.append(full_sample_pairs_f1)
 
+            inner_pred = sample_pred[1:-1]
+            inner_target = sample_target[1:-1]
+            if inner_target.numel() > 0:
+                try:
+                    batch_hit.append(metrics.hit_rate(inner_pred, inner_target))
+                    batch_recall.append(metrics.recall_rate(inner_pred, inner_target, unique=True))
+                    batch_lev.append(metrics.levenshtein_distance(inner_pred, inner_target, normalize=True))
+                    batch_dtw.append(metrics.dtw_distance(inner_pred, inner_target, normalize=True))
+                    if poi_meta:
+                        geo_err = metrics.average_geo_distance_error(inner_pred, inner_target, poi_meta)
+                        cat_cons = metrics.category_consistency_rate(inner_pred, inner_target, poi_meta)
+                        reg_match = metrics.region_match_rate(inner_pred, inner_target, poi_meta)
+                        path_err = metrics.relative_path_distance_error(inner_pred, inner_target, poi_meta, normalize=True)
+                        centroid_dist = metrics.centroid_geo_distance(inner_pred, inner_target, poi_meta)
+                        if not np.isnan(geo_err): batch_geo.append(geo_err)
+                        if not np.isnan(cat_cons): batch_cat.append(cat_cons)
+                        if not np.isnan(reg_match): batch_region.append(reg_match)
+                        if not np.isnan(path_err): batch_path_err.append(path_err)
+                        if not np.isnan(centroid_dist): batch_centroid.append(centroid_dist)
+                except Exception as _me:
+                    logger.log(f"[warn] metric calc error (test-inner): {_me}")
+            try:
+                # 使用 alt_sample_pred 计算 full-* 指标
+                full_hit.append(metrics.hit_rate(alt_sample_pred, sample_target))
+                full_recall.append(metrics.recall_rate(alt_sample_pred, sample_target, unique=True))
+                full_lev.append(metrics.levenshtein_distance(alt_sample_pred, sample_target, normalize=True))
+                full_dtw.append(metrics.dtw_distance(alt_sample_pred, sample_target, normalize=True))
+                if poi_meta:
+                    g2 = metrics.average_geo_distance_error(alt_sample_pred, sample_target, poi_meta)
+                    c2 = metrics.category_consistency_rate(alt_sample_pred, sample_target, poi_meta)
+                    r2 = metrics.region_match_rate(alt_sample_pred, sample_target, poi_meta)
+                    p2 = metrics.relative_path_distance_error(alt_sample_pred, sample_target, poi_meta, normalize=True)
+                    cent2 = metrics.centroid_geo_distance(alt_sample_pred, sample_target, poi_meta)
+                    if not np.isnan(g2): full_geo.append(g2)
+                    if not np.isnan(c2): full_cat.append(c2)
+                    if not np.isnan(r2): full_region.append(r2)
+                    if not np.isnan(p2): full_path_err.append(p2)
+                    if not np.isnan(cent2): full_centroid.append(cent2)
+            except Exception as _me:
+                logger.log(f"[warn] metric calc error (test-full): {_me}")
+
             repetition_ratio = metrics.count_adjacent_repetition_rate(alt_sample_pred)
             repetition_list.append(repetition_ratio)
             # torch.cuda.empty_cache()
     repetition = np.mean(repetition_list)
     alt_f1 = np.mean(batch_alt_f1)
     alt_pairs_f1 = np.mean(batch_alt_pairs_f1)
-    logger.log("[test-general] F1-Score: {:5.4f} Pairs-F1-Score: {:5.4f} Repetition: {:5.4f}. All-F1-Score: {:5.4f} All-Pairs-F1-Score: {:5.4f}." \
-               .format(alt_f1, alt_pairs_f1, repetition,
-                       np.mean(batch_alt_all_f1), np.mean(batch_alt_pairs_all_f1)))
+    hit_mean = np.mean(batch_hit) if batch_hit else float('nan')
+    recall_mean = np.mean(batch_recall) if batch_recall else float('nan')
+    lev_mean = np.mean(batch_lev) if batch_lev else float('nan')
+    dtw_mean = np.mean(batch_dtw) if batch_dtw else float('nan')
+    geo_mean = np.mean(batch_geo) if batch_geo else float('nan')
+    cat_mean = np.mean(batch_cat) if batch_cat else float('nan')
+
+    region_mean = np.mean(batch_region) if batch_region else float('nan')
+    path_err_mean = np.mean(batch_path_err) if batch_path_err else float('nan')
+    centroid_mean = np.mean(batch_centroid) if batch_centroid else float('nan')
+    full_hit_mean = np.mean(full_hit) if full_hit else float('nan')
+    full_recall_mean = np.mean(full_recall) if full_recall else float('nan')
+    full_lev_mean = np.mean(full_lev) if full_lev else float('nan')
+    full_dtw_mean = np.mean(full_dtw) if full_dtw else float('nan')
+    full_geo_mean = np.mean(full_geo) if full_geo else float('nan')
+    full_cat_mean = np.mean(full_cat) if full_cat else float('nan')
+    full_region_mean = np.mean(full_region) if full_region else float('nan')
+    full_path_err_mean = np.mean(full_path_err) if full_path_err else float('nan')
+    full_centroid_mean = np.mean(full_centroid) if full_centroid else float('nan')
+
+    logger.log("[test-general] F1: {:5.4f} Pairs-F1: {:5.4f} Repetition: {:5.4f} All-F1: {:5.4f} All-Pairs-F1: {:5.4f} | Hit: {} Recall: {} Lev: {} DTW: {} Geo: {} Cat: {} Region: {} PathErr: {} Centroid(km): {} | full-Hit: {} full-Recall: {} full-Lev: {} full-DTW: {} full-Geo: {} full-Cat: {} full-Region: {} full-PathErr: {} full-Centroid(km): {}".format(
+        alt_f1, alt_pairs_f1, repetition, np.mean(batch_alt_all_f1), np.mean(batch_alt_pairs_all_f1),
+        _fmt(hit_mean), _fmt(recall_mean), _fmt(lev_mean), _fmt(dtw_mean), _fmt(geo_mean), _fmt(cat_mean), _fmt(region_mean), _fmt(path_err_mean), _fmt(centroid_mean),
+        _fmt(full_hit_mean), _fmt(full_recall_mean), _fmt(full_lev_mean), _fmt(full_dtw_mean), _fmt(full_geo_mean), _fmt(full_cat_mean), _fmt(full_region_mean), _fmt(full_path_err_mean), _fmt(full_centroid_mean)))
 
 def test(model, model_path, test_loader, args, logger, n_region, train_am, train_pm):
     """
