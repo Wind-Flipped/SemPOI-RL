@@ -134,7 +134,8 @@ def main():
     set_seeds(args.seed)
     args.save_path = os.path.join(args.save_path, args.name)
     path_exist(args.save_path)
-
+    args.name = (args.dataset_name + "_semantic" + args.num_semantic_parts + "_diversity" + args.lambda_diversity
+            + "_attnreg" + args.lambda_attn_reg + "_mask" + args.mask_ratio)
 
     # Initializing a Logger instance for recording various metrics during the training process
     # args.log_path: Path where the log file is saved

@@ -107,7 +107,9 @@ def main():
         trainer = TravelStyleGRPOTrainer(
             model_name=args.model_name,
             device=args.device,
-            use_lora=False  # 数据准备阶段不需要LoRA
+            use_lora=False,  # 数据准备阶段不需要LoRA
+            lora_config="./grpo_Yelp_lora_model/checkpoint-3250",
+            is_train=False  # 仅用于生成数据集
         )
         print("✅ 数据处理器初始化完成!")
 

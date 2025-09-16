@@ -1,3 +1,4 @@
+# -*- coding: UTF-8 -*-
 """
 LLMs.py - 大语言模型调用接口和强化学习训练模块
 
@@ -28,7 +29,7 @@ import logging
 from dataclasses import dataclass
 from tqdm import tqdm
 import time
-from vllm import LLM, SamplingParams
+# from vllm import LLM, SamplingParams
 import logging
 
 # 导入accelerate库进行分布式训练
@@ -446,7 +447,9 @@ class TravelStyleGRPOTrainer:
                  lora_r: int = 16,
                  lora_alpha: int = 32,
                  lora_dropout: float = 0.1,
-                 use_accelerate: bool = False):
+                 use_accelerate: bool = False,
+                 lora_config: str = None,
+                 is_train: bool = True):
         """
         初始化GRPO训练器
 
@@ -463,6 +466,7 @@ class TravelStyleGRPOTrainer:
         self.model_name = model_name
         self.use_lora = use_lora
         self.use_accelerate = use_accelerate and ACCELERATE_AVAILABLE
+        self.lora_config = lora_config
         
         # 初始化accelerator
         if self.use_accelerate:
@@ -475,41 +479,43 @@ class TravelStyleGRPOTrainer:
         self.current_step = 0
         self.total_steps = 0
 
-        from sentence_transformers import SentenceTransformer
+        if is_train:
+            from sentence_transformers import SentenceTransformer
 
-        # 初始化相似度模型
-        self.similarity_model = SentenceTransformer(similarity_model_name, device="cuda:2")
+            # 初始化相似度模型
+            self.similarity_model = SentenceTransformer(similarity_model_name, device="cuda:2")
 
-        # 加载tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+            # 加载tokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # 加载模型
-        if self.use_accelerate:
-            # 使用accelerate时不设置device_map
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.bfloat16
-            )
-        else:
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                device_map="auto",
-                max_memory={0: "20GiB", 1: "20GiB", 2: "0GiB"},
-                torch_dtype=torch.bfloat16
-            )
+            # 加载模型
+            if self.use_accelerate:
+                # 使用accelerate时不设置device_map
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype=torch.bfloat16
+                )
+            else:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    device_map="auto",
+                    max_memory={0: "20GiB", 1: "20GiB", 2: "0GiB"},
+                    torch_dtype=torch.bfloat16
+                )
 
-        # 配置LoRA
-        if self.use_lora:
-            lora_config = LoraConfig(
-                r=lora_r,
-                lora_alpha=lora_alpha,
-                target_modules=["q_proj", "v_proj"],
-                lora_dropout=lora_dropout,
-                task_type="CAUSAL_LM"
-            )
-            self.model = get_peft_model(self.model, lora_config)
+            # 配置LoRA
+            if self.use_lora:
+                if self.lora_config is None:
+                    self.lora_config = LoraConfig(
+                        r=lora_r,
+                        lora_alpha=lora_alpha,
+                        target_modules=["q_proj", "v_proj"],
+                        lora_dropout=lora_dropout,
+                        task_type="CAUSAL_LM"
+                    )
+                self.model = get_peft_model(self.model, self.lora_config)
 
         logger.info("GRPO trainer initialized with LoRA and Accelerate" if (use_lora and self.use_accelerate) 
                    else "GRPO trainer initialized with LoRA" if use_lora 
@@ -548,7 +554,7 @@ class TravelStyleGRPOTrainer:
             print(f"{'='*80}")
 
             # 生成LLM参考答案
-            destination_generator = TravelStyleGenerator(self.model_name, self.device)
+            destination_generator = TravelStyleGenerator(use_lora=self.use_lora, lora_path=self.lora_config if self.use_lora else None, use_vllm=False)
 
             # 收集所有需要处理的数据
             all_items = []
@@ -661,7 +667,7 @@ class TravelStyleGRPOTrainer:
                 # 生成时间戳文件名
                 import datetime
                 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                dataset_name = f"{dataset_name}_{timestamp}"
+                dataset_name = f"{dataset_name}_grpo_{timestamp}"
                 dataset_path = os.path.join(dataset_dir, dataset_name)
 
                 # 保存dataset
@@ -716,15 +722,16 @@ class TravelStyleGRPOTrainer:
     def train(self, text_dataset=None,
               output_dir: str = "./grpo_travel_style_model",
               run_name: str = "travel_style_grpo",
-              num_train_epochs: int = 1,
+              num_train_epochs: int = 2,
               learning_rate: float = 5e-5,
               per_device_train_batch_size: int = 2,
-              gradient_accumulation_steps: int = 2,
+              gradient_accumulation_steps: int = 1,
               num_generations: int = 4,
               max_prompt_length: int = 2048,
               max_completion_length: int = 256,
               save_steps: int = 250,
-              logging_steps: int = 1):
+              logging_steps: int = 1,
+              is_gspo: bool = False):
         """
         使用GRPO训练模型
 
@@ -787,41 +794,81 @@ class TravelStyleGRPOTrainer:
             }
             if text_dataset:
                 config_dict["num_trajectories"] = len(text_dataset)
-
-            swanlab.init(
-                project="travel-style-grpo",
-                experiment_name=run_name,
-                config=config_dict
-            )
+            if is_gspo:
+                swanlab.init(
+                    project="travel-style-gspo",
+                    experiment_name=run_name,
+                    config=config_dict
+                )
+            else:
+                swanlab.init(
+                    project="travel-style-grpo",
+                    experiment_name=run_name,
+                    config=config_dict
+                )
             logger.info("SwanLab experiment initialized")
         else:
             logger.warning("SwanLab not available, metrics will not be logged")
 
         # 配置训练参数
-        training_args = GRPOConfig(
-            output_dir=output_dir,
-            # 禁用wandb相关功能
-            report_to=None,  # 不报告到任何平台
-            run_name=run_name,
-            learning_rate=learning_rate,
-            adam_beta1=0.9,
-            adam_beta2=0.99,
-            # weight_decay=0.1,
-            # warmup_ratio=0.1,
-            lr_scheduler_type='cosine',
-            logging_steps=logging_steps,
-            bf16=True,
-            per_device_train_batch_size=per_device_train_batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            num_generations=num_generations,
-            max_prompt_length=max_prompt_length,
-            max_completion_length=max_completion_length,
-            num_train_epochs=num_train_epochs,
-            save_steps=save_steps,
-            max_grad_norm=0.1,
-            log_on_each_node=False,
-            use_vllm=False,
-        )
+        if is_gspo:
+            training_args = GRPOConfig(
+                output_dir=output_dir,
+                importance_sampling_level="sequence",
+                loss_type="grpo",
+                beta=0.0,
+                # GSPO set KL regularization to zero: https://github.com/volcengine/verl/pull/2775#issuecomment-3131807306
+                epsilon=3e-4,  # GSPO paper (v2), section 5.1
+                epsilon_high=4e-4,  # GSPO paper (v2), section 5.1
+                gradient_accumulation_steps=1,
+                steps_per_generation=4,
+                # partition rollout batch into 4 mini-batches. GSPO paper (v2), section 5.1. Must be 4 times gradient_accumulation_steps
+                # 禁用wandb相关功能
+                report_to=None,  # 不报告到任何平台
+                run_name=run_name,
+                learning_rate=learning_rate,
+                adam_beta1=0.9,
+                adam_beta2=0.99,
+                # weight_decay=0.1,
+                # warmup_ratio=0.1,
+                lr_scheduler_type='cosine',
+                logging_steps=logging_steps,
+                bf16=True,
+                per_device_train_batch_size=per_device_train_batch_size,
+                num_generations=num_generations,
+                max_prompt_length=max_prompt_length,
+                max_completion_length=max_completion_length,
+                num_train_epochs=num_train_epochs,
+                save_steps=save_steps,
+                max_grad_norm=0.1,
+                log_on_each_node=False,
+                use_vllm=False,
+            )
+        else:
+            training_args = GRPOConfig(
+                output_dir=output_dir,
+                # 禁用wandb相关功能
+                report_to=None,  # 不报告到任何平台
+                run_name=run_name,
+                learning_rate=learning_rate,
+                adam_beta1=0.9,
+                adam_beta2=0.99,
+                # weight_decay=0.1,
+                # warmup_ratio=0.1,
+                lr_scheduler_type='cosine',
+                logging_steps=logging_steps,
+                bf16=True,
+                per_device_train_batch_size=per_device_train_batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                num_generations=num_generations,
+                max_prompt_length=max_prompt_length,
+                max_completion_length=max_completion_length,
+                num_train_epochs=num_train_epochs,
+                save_steps=save_steps,
+                max_grad_norm=0.1,
+                log_on_each_node=False,
+                use_vllm=False,
+            )
 
         # 定义奖励函数，传入reference_responses和进度跟踪作为闭包变量
         def similarity_reward_func(prompts, completions, reference, **kwargs):
@@ -905,6 +952,7 @@ class TravelStyleGRPOTrainer:
                 args=training_args,
                 train_dataset=dataset,
             )
+            trainer.current_gradient_accumulation_steps = 1  # 与grpo_trainer.py兼容
 
         logger.info("Starting GRPO training...")
         print(f"\n🚀 开始强化学习训练...")
@@ -982,16 +1030,17 @@ def main():
 
     # 准备训练和测试数据
     from datasets import load_from_disk
-    text_dataset = load_from_disk("../dataset/travel_dataset_20250712_201017")
+    text_dataset = load_from_disk("../dataset/Yelp_20250714_192438")
 
     # 训练模型
     trainer.train(
         text_dataset=text_dataset,
-        output_dir="./grpo_travel_style_lora_model",
-        run_name="travel_style_grpo_lora",
-        num_train_epochs=10,
-        per_device_train_batch_size=1,  # 减小批次大小适应示例数据
-        gradient_accumulation_steps=8
+        output_dir="./grpo_Yelp_lora_model",
+        run_name="travel_Yelp_style_grpo_lora",
+        num_train_epochs=3,
+        per_device_train_batch_size=2,  # 减小批次大小适应示例数据
+        gradient_accumulation_steps=2,
+        is_gspo=False
     )
 
     # 评估模型

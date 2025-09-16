@@ -11,10 +11,10 @@ for mask_ratio in "${mask_ratios[@]}"; do
         # 遍历lambda_diversity数组
         for lambda in "${lambda_diversity_params[@]}"; do
             # 构造日志文件路径（包含两个参数值）
-            log_file="../new_results_${dataset_name}8/${dataset_name}_mask${mask_ratio}_${num_parts}_lambda_${lambda}.log"
+            log_file="../new_results_${dataset_name}11/${dataset_name}_mask${mask_ratio}_${num_parts}_lambda_${lambda}.log"
 
             # 确保结果目录存在
-            mkdir -p "../new_results_${dataset_name}8"
+            mkdir -p "../new_results_${dataset_name}11"
 
             # 打印当前运行的信息（可选）
             echo "Running experiment with mask_ratio = $mask_ratio, num_semantic_parts=$num_parts, lambda_diversity=$lambda, logging to $log_file"
@@ -39,10 +39,10 @@ for mask_ratio in "${mask_ratios[@]}"; do
         # 遍历lambda_diversity数组
         for lambda in "${lambda_diversity_params[@]}"; do
             # 构造日志文件路径（包含两个参数值）
-            log_file="../new_results_${dataset_name}8/${dataset_name}_mask${mask_ratio}_${num_parts}_lambda_${lambda}.log"
+            log_file="../new_results_${dataset_name}11/${dataset_name}_mask${mask_ratio}_${num_parts}_lambda_${lambda}.log"
 
             # 确保结果目录存在
-            mkdir -p "../new_results_${dataset_name}8"
+            mkdir -p "../new_results_${dataset_name}11"
 
             # 打印当前运行的信息（可选）
             echo "Running experiment with mask_ratio = $mask_ratio, num_semantic_parts=$num_parts, lambda_diversity=$lambda, logging to $log_file"
