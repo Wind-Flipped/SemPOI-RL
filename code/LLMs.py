@@ -9,7 +9,7 @@ LLMs.py - 大语言模型调用接口和强化学习训练模块
 """
 
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2'  # 设置可见GPU设备
+os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3'  # 设置可见GPU设备
 
 import torch
 import torch.nn as nn
@@ -220,7 +220,7 @@ class TravelStyleRewardCalculator:
         Args:
             similarity_model: 用于计算文本相似度的模型
         """
-        self.similarity_model = SentenceTransformer(similarity_model, device="cuda:1")
+        self.similarity_model = SentenceTransformer(similarity_model, device="cuda:3")
         logger.info(f"Reward calculator initialized with {similarity_model}")
 
     def calculate_similarity(self, text1: str, text2: str) -> float:

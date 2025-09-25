@@ -3,6 +3,7 @@ from ast import parse
 # import os
 # os.environ["CUDA_VISIBLE_DEVICES"] = "1, 2"  # Set the visible GPU device
 import os
+
 os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3'  # 设置可见GPU设备
 import torch
 import torch.nn as nn
@@ -19,6 +20,7 @@ import os
 import sys
 from copy import copy
 import warnings
+
 warnings.filterwarnings('ignore')
 try:
     import ipdb
@@ -33,6 +35,7 @@ import metrics
 from trainer import *
 
 import pickle
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -69,13 +72,13 @@ def main():
     parser.add_argument('--name', type=str, default="default")
     # parser.add_argument('--model', type=str, default="base")
     parser.add_argument('--device', type=str, default="cuda:0")
-    parser.add_argument("--stop_epoch", type=int, default=2) # early stopping
+    parser.add_argument("--stop_epoch", type=int, default=2)  # early stopping
     parser.add_argument("--fine_stop", type=int, default=12)
 
     # Knowledge Graph (KG) Arguments
     parser.add_argument("--segments", type=int, default=16)
     parser.add_argument("--kg", action="store_true")
-    parser.add_argument("--entity_num_per_poi", type=int, default=2) # Note: F 2 For Yelp, use 10
+    parser.add_argument("--entity_num_per_poi", type=int, default=2)  # Note: F 2 For Yelp, use 10
     parser.add_argument("--train_trans", action="store_true")
     parser.add_argument('--trans', type=str, default="transe")
     parser.add_argument("--contrast", action="store_true")
@@ -92,7 +95,8 @@ def main():
     parser.add_argument('--confidence', type=float, default=0.5)
     # ODE
     parser.add_argument("--ode", action="store_true")
-    parser.add_argument("--t_unif_res", type=int, default=10, help="Number of point in unfirom temporal grid used for intepolation.")
+    parser.add_argument("--t_unif_res", type=int, default=10,
+                        help="Number of point in unfirom temporal grid used for intepolation.")
     parser.add_argument("--solver", type=str, default="dopri5", help="Name of the ODE solver (see torchdiffeq).")
     parser.add_argument("--rtol", type=float, default=1e-5, help="Relative tolerance for ODE solver.")
     parser.add_argument("--atol", type=float, default=1e-5, help="Absolute tolerance for ODE solver.")
@@ -101,7 +105,8 @@ def main():
     # Model (lm).
     parser.add_argument("--lm_hid_layers", type=int, default=3, help="Number of hidden layers in intensity function.")
     parser.add_argument("--lm_latent_dim", type=int, default=128, help="Hidden layer dimension in intensity function.")
-    parser.add_argument("--sig_v", type=float, default=0.6, help="Observation variance.")  # Note: F 0.6 For Yelp, use 0.4
+    parser.add_argument("--sig_v", type=float, default=0.6,
+                        help="Observation variance.")  # Note: F 0.6 For Yelp, use 0.4
 
     parser.add_argument("--s_infer", action="store_true")
     parser.add_argument("--use_llm", action="store_true", help="Use LLM for training")
@@ -109,13 +114,17 @@ def main():
     parser.add_argument("--use_vllm", action="store_true", help="Use vllm for training")
     parser.add_argument("--llm_embedding_dim", type=int, default=256, help="Embedding dimension for LLM")
     parser.add_argument("--use_lora", action="store_true", help="Use LLM trained with LoRA for training")
-    parser.add_argument("--lora_path", type=str, default="./grpo_travel_style_lora_model/checkpoint-5500", help="Path to the LoRA model")
-    parser.add_argument("--dataset_path", type=str, default="../dataset/Yelp_20250714_192438", help="Path to the dataset for LLM training")
+    parser.add_argument("--lora_path", type=str, default="./grpo_Foursquare_f1_cat_0.75_0.1_8_lora_model/checkpoint-4509",
+                        help="Path to the LoRA model")
+    parser.add_argument("--dataset_path", type=str, default="../dataset/Yelp_20250714_192438",
+                        help="Path to the dataset for LLM training")
     parser.add_argument("--st_module", action="store_true", help="use SpatialTemporal module")
     # Semantic Masking parameters
-    parser.add_argument("--num_semantic_parts", type=int, default=0, help="Number of semantic parts for semantic-aware masking in MAE. Set to 0 to disable semantic masking and use random masking only.")
+    parser.add_argument("--num_semantic_parts", type=int, default=0,
+                        help="Number of semantic parts for semantic-aware masking in MAE. Set to 0 to disable semantic masking and use random masking only.")
     parser.add_argument("--lambda_diversity", type=float, default=0.1, help="Weight for diversity loss in MAE.")
-    parser.add_argument("--lambda_attn_reg", type=float, default=0.1, help="Weight for attention regulation loss in MAE.")
+    parser.add_argument("--lambda_attn_reg", type=float, default=0.1,
+                        help="Weight for attention regulation loss in MAE.")
     parser.add_argument("--mask_ratio", type=float, default=0.5, help="Mask ratio for MAE.")
 
     # Yelp: ../dataset/Yelp_20250714_192438
@@ -134,8 +143,9 @@ def main():
     elif args.dataset_name == 'Yelp':
         args.dataset_path = '../dataset/Yelp_20250714_192438'
     set_seeds(args.seed)
-    args.name = (args.dataset_name + "_semantic" + str(args.num_semantic_parts) + "_diversity" + str(args.lambda_diversity)
-            + "_attnreg" + str(args.lambda_attn_reg) + "_mask" + str(args.mask_ratio))
+    args.name = (args.dataset_name + "_semantic" + str(args.num_semantic_parts) + "_diversity" + str(
+        args.lambda_diversity)
+                 + "_attnreg" + str(args.lambda_attn_reg) + "_mask" + str(args.mask_ratio))
     args.save_path = os.path.join(args.save_path, args.name)
     path_exist(args.save_path)
 
@@ -148,7 +158,6 @@ def main():
     logger.log(str(args))
     logger.log("Experiment name: %s" % args.name)
 
-
     # Loading the travel dataset with parameters and data paths specified in args
     data = TravelDataset(args, args.ori_data, args.dst_data, args.trans_data)
 
@@ -159,7 +168,7 @@ def main():
         kg_data = None
     train_data, valid_data, test_data = random_split(data, dataset_name=dataset_name, split_path=args.data_split_path)
 
-    train_loader = DataLoader(train_data, args.train_batch, shuffle=True, collate_fn=collate_fn)
+    # train_loader = DataLoader(train_data, args.train_batch, shuffle=True, collate_fn=collate_fn)
     valid_loader = DataLoader(valid_data, args.test_batch, shuffle=False, collate_fn=collate_fn)
     test_loader = DataLoader(test_data, args.test_batch, shuffle=False, collate_fn=collate_fn)
 
@@ -167,31 +176,15 @@ def main():
     max_d_length = max(len(seq) for seq in data.dsts)
     max_o_length = max(len(seq) for seq in data.oris)
 
-    if args.model == 'SPOT-Trip':
-        model = SPOTModel(args, len(data.poi_idx) + 1, data.region_poi, max_d_length, max_o_length,
-                          d_model=args.hidden_size, n_head=4, num_encoder_layers=1, d_z=args.hidden_size, kg_dataset=kg_data).to(args.device)
-        train_am = None
-        train_pm = None
-    # Training or testing the model based on the mode specified in args
-    elif args.model == 'AR-Trip':
-        train_am = poi_adjacent(train_data, len(data.poi_idx) + 1)
-        train_pm, confidence = poi_position(train_data, len(data.poi_idx) + 1, max_d_length)
-        train_am = torch.tensor(train_am).to(args.device)
-        train_pm = torch.tensor(train_pm).to(args.device)
-        args.confidence = confidence
-        model = ARModel(args, len(data.poi_idx) + 1, 25, args.drifting, args.guiding, data.region_poi,
-                         args.repetition_beta,
-                         max_d_length, d_model=args.hidden_size, n_head=4, num_encoder_layers=1).to(args.device)
 
-    if args.mode == 'train':
-        best = train_single_phase(model, train_loader, valid_loader, test_loader, args, logger, kg_data, train_am, train_pm)
+    model = SPOTModel(args, len(data.poi_idx) + 1, data.region_poi, max_d_length, max_o_length,
+                          d_model=args.hidden_size, n_head=4, num_encoder_layers=1, d_z=args.hidden_size,
+                          kg_dataset=kg_data).to(args.device)
 
-        # test(model, os.path.join(args.save_path, "model_{}.xhr".format(best)), test_loader, args, logger, n_region, train_am, train_pm)
-        print("################## current exp done ##################")
-    elif args.mode == 'test':
-        test(model, os.path.join(args.save_path, "model_best.xhr"), test_loader, args, logger, n_region, train_am, train_pm)
+    test(model, os.path.join(args.save_path, "model_0.xhr"), valid_loader, args, logger, n_region)
 
     logger.close_log()
-    
+
+
 if __name__ == "__main__":
     main()

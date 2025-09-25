@@ -11,7 +11,7 @@ LLMs.py - 大语言模型调用接口和强化学习训练模块
 """
 import os
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '1, 2, 3'  # 设置可见GPU设备
+os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3'  # 设置可见GPU设备
 import sys
 
 import torch
@@ -26,7 +26,8 @@ from tqdm import tqdm
 import time
 # from vllm import LLM, SamplingParams
 import logging
-
+import pickle
+from metrics import category_consistency_rate
 # 导入accelerate库进行分布式训练
 try:
     from accelerate import Accelerator
@@ -193,14 +194,14 @@ def travel_style_length_reward_func(prompts, completions, reference_responses, *
 class _RLArgsStub:
     """最小化参数对象，满足SPOTModel推理所需字段。"""
     # 与main.py中的默认值保持一致，必要时可在TravelStyleGRPOTrainer初始化时覆盖
-    def __init__(self, device="cuda:0", use_llm=True, use_target_llm=True,
+    def __init__(self, device="cuda:1", use_llm=True, use_target_llm=True,
                  use_vllm=False, use_lora=False, lora_path="./grpo_travel_style_lora_model/checkpoint-5500",
                  llm_embedding_dim=256, hidden_size=256,
                  kg=False, ode=False, s_infer=False, st_module=True,
                  lm_hid_layers=3, lm_latent_dim=128,
                  dyn_hid_layers=3, dyn_latent_dim=128,
                  tau=0.2, sig_v=0.6, confidence=0.5,
-                 num_semantic_parts=16, lambda_diversity=0.2,
+                 num_semantic_parts=8, lambda_diversity=0.1,
                  lambda_attn_reg=0.1, mask_ratio=0.75,
                  dataset_name: str = "Yelp"):
         self.device = device
@@ -239,6 +240,12 @@ class F1RewardEvaluator:
         self.dataset_name = dataset_name
         self.run_name = run_name
         self.device = device
+        self.poi_meta = None
+        try:
+            with open(f'../{dataset_name}/poi_meta.pkl', 'rb') as f:
+                self.poi_meta = pickle.load(f)
+        except Exception as _e:
+            logger.log(f"[warn] 无法加载 poi_meta.pkl: {_e}")
 
         self._data = None
         self._model = None
@@ -252,8 +259,8 @@ class F1RewardEvaluator:
         base = os.path.abspath(os.path.join(os.path.dirname(__file__), f"../{self.dataset_name}/model_save/{self.run_name}"))
         if not os.path.isdir(base):
             raise FileNotFoundError(f"未找到模型目录: {base}")
-        # 使用model_4.xhr
-        best = os.path.join(base, "model_4.xhr")
+        # 使用model_0.xhr
+        best = os.path.join(base, "model_0.xhr")
         if os.path.exists(best):
             return best
         else:
@@ -426,6 +433,72 @@ class F1RewardEvaluator:
             f1_scores = f1_scores[:bsz]
         return f1_scores
 
+    def compute_batch_f1_category(self, prompts, completions) -> list[float]:
+        """
+        给定一批次RL生成文本，取数据集中对应顺序的样本，
+        将文本作为messages输入模型进行推理，返回每个样本的sample_f1和类别一致率。
+        """
+        self._lazy_load_data_and_model()
+        msgs = self._tensorize_messages(completions)
+
+        bsz = len(msgs)
+        N = len(self._data)
+        # 取连续下标，必要时取模
+        idxs = [ (self._offset + i) % N for i in range(bsz) ]
+        self._offset = (self._offset + bsz) % N
+
+        loader = self._get_subset_loader(idxs, batch_size=bsz)
+
+        f1_scores: list[float] = []
+        cat_scores: list[float] = []
+        # 遍历一个batch（期望只有1个，因为batch_size=bsz）
+        with torch.no_grad():
+            for (uid, o_ck, d_ck, masked_d_ck, o_h, d_h, masked_d_h, o_t, d_t, o_l, d_l, o_pad, d_pad, o_rg, d_rg) in loader:
+                # 将messages列表传入forward
+                uid = uid.to(self.device)
+                o_ck = o_ck.to(self.device)
+                masked_d_ck = masked_d_ck.to(self.device)
+                d_ck = d_ck.to(self.device)
+                o_h = o_h.to(self.device)
+                masked_d_h = masked_d_h.to(self.device)
+                d_h = d_h.to(self.device)
+                o_t = o_t.to(self.device)
+                d_t = d_t.to(self.device)
+                o_l = o_l.to(self.device)
+                d_l = d_l.to(self.device)
+                o_pad = o_pad.to(self.device)
+                d_pad = d_pad.to(self.device)
+                o_rg = o_rg.to(self.device)
+                d_rg = d_rg.to(self.device)
+
+                # 预测
+                predicted_ids = self._model(uid, msgs, o_ck, masked_d_ck, o_t, d_t, o_l, d_l, o_pad, d_pad, d_ck, o_rg,
+                                      d_rg, target_seq=None)
+
+
+                # 分样本计算F1
+                for i in range(predicted_ids.shape[0]):
+                    sample_pred = predicted_ids[i].cpu()  # shape: [seq_len]
+                    sample_target = d_ck[i].cpu()  # shape: [seq_len]
+
+                    # Exclude padded values (assuming padding is represented by 0)
+                    non_padded_indices = sample_target != 0
+                    sample_pred = sample_pred[non_padded_indices]
+                    sample_target = sample_target[non_padded_indices]
+                    sample_pred = sample_pred[1:-1]  # Exclude start and end tokens
+                    sample_target = sample_target[1:-1]  # Exclude start and end tokens
+                    f1 = self._sample_f1(sample_pred, sample_target)
+                    f1_scores.append(float(max(0.0, min(1.0, f1))))
+                    # 计算类别一致率
+                    cat_rate = category_consistency_rate(sample_pred, sample_target, self.poi_meta)
+                    cat_scores.append(float(max(0.0, min(1.0, cat_rate))))
+
+        # 与输入数量对齐（理论上相等）
+        if len(f1_scores) < bsz:
+            f1_scores += [0.0] * (bsz - len(f1_scores))
+        elif len(f1_scores) > bsz:
+            f1_scores = f1_scores[:bsz]
+        return f1_scores, cat_scores
 
 def travel_style_f1_reward_func(evaluator: F1RewardEvaluator, prompts, completions, reference_responses, **kwargs) -> list[float]:
     """
@@ -444,6 +517,24 @@ def travel_style_f1_reward_func(evaluator: F1RewardEvaluator, prompts, completio
         print(f"F1奖励(均值): {sum(rewards)/len(rewards):.4f} | 样本数: {len(rewards)}")
     return rewards
 
+def travel_style_f1_category_reward_func(evaluator: F1RewardEvaluator, prompts, completions, reference_responses, **kwargs) -> list[float]:
+    """
+    基于保存的SPOTModel计算样本级F1作为奖励。
+    返回值范围[0,1]，与trainer.py中的sample_f1一致语义。
+    """
+    # 直接调用评估器
+    # try:
+    #     rewards = evaluator.compute_batch_f1(prompts, completions)
+    # except Exception as e:
+    #     print(f"[F1-Reward] 计算失败: {e}")
+    #     rewards = [0.0 for _ in range(len(completions))]
+    f1_rewards, cat_rewards = evaluator.compute_batch_f1_category(prompts, completions)
+    # 打印摘要
+    if f1_rewards:
+        print(f"f1奖励(均值): {sum(f1_rewards)/len(f1_rewards):.4f} | 样本数: {len(f1_rewards)}")
+    if cat_rewards:
+        print(f"类别一致率奖励(均值): {sum(cat_rewards)/len(cat_rewards):.4f} | 样本数: {len(cat_rewards)}")
+    return f1_rewards, cat_rewards
 
 class TravelStyleGRPOTrainer:
     """使用GRPO方法训练旅游风格生成模型"""
@@ -451,7 +542,7 @@ class TravelStyleGRPOTrainer:
     def __init__(self,
                  model_name: str = "../LLMs/Qwen3-8B",
                  similarity_model_name: str = "../LLMs/Qwen3-Embedding-4B",
-                 device: str = "cuda",
+                 device: str = "cuda:0",
                  use_lora: bool = True,
                  lora_r: int = 16,
                  lora_alpha: int = 32,
@@ -506,7 +597,6 @@ class TravelStyleGRPOTrainer:
 
         if is_train:
             from sentence_transformers import SentenceTransformer
-
             # 初始化相似度模型
             self.similarity_model = SentenceTransformer(similarity_model_name, device="cuda:2")
 
@@ -526,7 +616,7 @@ class TravelStyleGRPOTrainer:
                 self.model = AutoModelForCausalLM.from_pretrained(
                     model_name,
                     device_map="auto",
-                    # max_memory={0: "20GiB", 1: "0GiB", 2: "20GiB"},
+                    max_memory={0: "20GiB", 1: "20GiB"},
                     torch_dtype=torch.bfloat16
                 )
 
@@ -563,7 +653,10 @@ class TravelStyleGRPOTrainer:
               logging_steps: int = 1,
               is_gspo: bool = False,
               use_f1_reward: bool = True,
-              acc_reward: float = 1.0):
+              acc_reward: float = 1.0,
+              use_category: bool = True,
+              category_reward: float = 1.0,
+              ):
         """
         使用GRPO训练模型
 
@@ -790,12 +883,41 @@ class TravelStyleGRPOTrainer:
                     pass
             return scaled
 
+        def f1_category_reward_func(prompts, completions, reference, **kwargs):
+            self.training_progress.set_postfix({
+                'Step': f"{self.current_step}/{self.total_steps}",
+                'Phase': 'F1与类别奖励计算'
+            })
+            if self.f1_evaluator is None:
+                logger.error("F1评估器不可用，返回0奖励")
+                return [0.0 for _ in range(len(completions))]
+            f1_rewards, cat_rewards = travel_style_f1_category_reward_func(self.f1_evaluator, prompts, completions, reference, **kwargs)
+            # 按权重缩放F1奖励
+            f1_scaled = [float(r) * float(acc_reward) for r in f1_rewards]
+            cat_scaled = [float(r) * float(category_reward) for r in cat_rewards]
+            scaled = [f + c for f, c in zip(f1_scaled, cat_scaled)]
+            print(f"预测结果奖励均值: {sum(scaled)/len(scaled) if scaled else 0.0:.4f}")
+            if SWANLAB_AVAILABLE:
+                try:
+                    swanlab.log({
+                        "reward/f1_raw": sum(f1_rewards)/len(f1_rewards) if f1_rewards else 0.0,
+                        "reward/f1": sum(f1_scaled)/len(f1_scaled) if f1_scaled else 0.0,
+                        "reward/cat_raw": sum(cat_rewards)/len(cat_rewards) if cat_rewards else 0.0,
+                        "reward/cat": sum(cat_scaled)/len(cat_scaled) if cat_scaled else 0.0,
+                        "step": self.current_step
+                    })
+                except Exception:
+                    pass
+            return scaled
+
         # 创建GRPO训练器
         if self.use_accelerate:
             # 使用accelerate准备模型和数据集
             model, dataset = self.accelerator.prepare(self.model, dataset)
             reward_list = [similarity_reward_func]
-            if use_f1_reward:
+            if use_f1_reward and use_category:
+                reward_list.append(f1_category_reward_func)
+            elif use_f1_reward:
                 reward_list.append(f1_reward_func)
             trainer = GRPOTrainer(
                 model=model,
@@ -806,7 +928,9 @@ class TravelStyleGRPOTrainer:
             )
         else:
             reward_list = [similarity_reward_func]
-            if use_f1_reward:
+            if use_f1_reward and use_category:
+                reward_list.append(f1_category_reward_func)
+            elif use_f1_reward:
                 reward_list.append(f1_reward_func)
             trainer = GRPOTrainer(
                 model=self.model,
@@ -887,6 +1011,7 @@ def main():
     # 初始化训练器（使用LoRA和accelerate）
     trainer = TravelStyleGRPOTrainer(
         model_name="../LLMs/Qwen3-8B",
+        model_run_name=dataset_name + "_semantic8_diversity0.1_attnreg0.1_mask0.75",
         dataset_name=dataset_name,
         use_lora=True,
         lora_r=16,
@@ -898,12 +1023,12 @@ def main():
     from datasets import load_from_disk
     if dataset_name == "Foursquare":
         text_dataset = load_from_disk("../dataset/travel_dataset_20250712_201017")
-        output_dir = "./grpo_Foursquare_acc_lora_model"
-        run_name = "travel_Foursquare_style_grpo_acc_lora"
+        output_dir = "./grpo_Foursquare_f1_cat_0.75_0.1_8_lora_model"
+        run_name = "Foursquare_grpo_f1_cat_0.75_0.1_8"
     else:
         text_dataset = load_from_disk("../dataset/Yelp_20250714_192438")
-        output_dir = "./grpo_Yelp_acc_lora_model"
-        run_name = "travel_Yelp_style_grpo_acc_lora"
+        output_dir = "./grpo_Yelp_f1_cat_0.75_0.1_8_lora_model"
+        run_name = "Yelp_style_f1_cat_0.75_0.1_8"
 
     # 训练模型
     trainer.train(
@@ -912,7 +1037,9 @@ def main():
         run_name=run_name,
         num_train_epochs=3,
         per_device_train_batch_size=1,  # 减小批次大小适应示例数据
-        gradient_accumulation_steps=4,
+        gradient_accumulation_steps=8,
+        use_category=True,
+        use_f1_reward=True,
         is_gspo=False
     )
 

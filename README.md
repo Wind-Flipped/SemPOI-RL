@@ -61,3 +61,11 @@ If you want to use the SpatialTemporal module instead of ODE for training, you c
 cd ./code
 python main.py --model SPOT-Trip --mode train --train_trans --s_infer --use_llm --use_target_llm --use_vllm --st_module --llm_embedding_dim 256
 ```
+
+## Run the whole model for final results
+If you want to run the whole model for final results, open "./code/eval.py" file add modify the lora_path and model_*.xhr.
+Run the following command:
+```cmd
+cd ./code
+nohup python eval.py --model SPOT-Trip --dataset_name Foursquare --st_module --use_llm --use_lora --hidden_size 256 --llm_embedding_dim 256 --num_semantic_parts 8 --lambda_diversity 0.1 --mask_ratio 0.75> ../final_results/Foursquare_final_results.log 2>&1 &
+```
