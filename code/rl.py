@@ -19,7 +19,9 @@ from transformers import (
     AutoTokenizer, AutoModelForCausalLM,
     TrainingArguments
 )
-from trl import GRPOConfig, GRPOTrainer
+from transformers.trainer_callback import TrainerCallback
+from trl import GRPOConfig, GRPOTrainer, SFTTrainer
+# from trl import SFTTrainer
 from peft import LoraConfig, get_peft_model
 from data import TravelDataset
 from tqdm import tqdm
@@ -27,7 +29,7 @@ import time
 # from vllm import LLM, SamplingParams
 import logging
 import pickle
-from metrics import category_consistency_rate
+from metrics import category_consistency_rate, hit_rate, recall_rate, diversity_rate
 # 导入accelerate库进行分布式训练
 try:
     from accelerate import Accelerator
@@ -49,19 +51,9 @@ except ImportError:
 from prompt import TravelTrajectory, TravelPromptFormatter
 
 # ===== 为F1奖励加载SPOT-Trip模型与数据所需依赖 =====
-# 确保当前文件可以相对导入同目录下模块
-try:
-    from data import TravelDataset, random_split  # 数据集
-    from utils import collate_fn  # DataLoader的聚合函数
-    from model import SPOTModel  # 主模型
-except Exception as _e:
-    # 如果导入失败，尝试把当前目录加入路径
-    _CUR_DIR = os.path.dirname(os.path.abspath(__file__))
-    if _CUR_DIR not in sys.path:
-        sys.path.append(_CUR_DIR)
-    from data import TravelDataset, random_split
-    from utils import collate_fn
-    from model import SPOTModel
+from data import TravelDataset, random_split  # 数据集
+from utils import collate_fn  # DataLoader的聚合函数
+from model import SPOTModel  # 主模型
 
 # 设置日志
 logging.basicConfig(level=logging.INFO)
@@ -259,8 +251,8 @@ class F1RewardEvaluator:
         base = os.path.abspath(os.path.join(os.path.dirname(__file__), f"../{self.dataset_name}/model_save/{self.run_name}"))
         if not os.path.isdir(base):
             raise FileNotFoundError(f"未找到模型目录: {base}")
-        # 使用model_0.xhr
-        best = os.path.join(base, "model_0.xhr")
+        # 使用model_0.xhr # TODO
+        best = os.path.join(base, "model_5.xhr")
         if os.path.exists(best):
             return best
         else:
@@ -343,6 +335,18 @@ class F1RewardEvaluator:
         if denom == 0:
             return 0.0
         return 2.0 * inter / denom
+
+    def _hit_num(self, pred_ids: torch.Tensor, true_ids: torch.Tensor) -> int:
+        # 移除padding 0
+        p = [int(x) for x in pred_ids.tolist() if int(x) != 0]
+        t = [int(x) for x in true_ids.tolist() if int(x) != 0]
+        if len(p) == 0 and len(t) == 0:
+            return 0.0
+        if len(p) == 0 or len(t) == 0:
+            return 0.0
+        ps, ts = set(p), set(t)
+        inter = len(ps & ts)
+        return inter
 
     def _get_subset_loader(self, indices: list[int], batch_size: int):
         """
@@ -488,10 +492,10 @@ class F1RewardEvaluator:
                     sample_pred = sample_pred[1:-1]  # Exclude start and end tokens
                     sample_target = sample_target[1:-1]  # Exclude start and end tokens
                     f1 = self._sample_f1(sample_pred, sample_target)
-                    f1_scores.append(float(max(0.0, min(1.0, f1))))
+                    f1_scores.append(f1)
                     # 计算类别一致率
                     cat_rate = category_consistency_rate(sample_pred, sample_target, self.poi_meta)
-                    cat_scores.append(float(max(0.0, min(1.0, cat_rate))))
+                    cat_scores.append(cat_rate)
 
         # 与输入数量对齐（理论上相等）
         if len(f1_scores) < bsz:
@@ -499,6 +503,76 @@ class F1RewardEvaluator:
         elif len(f1_scores) > bsz:
             f1_scores = f1_scores[:bsz]
         return f1_scores, cat_scores
+
+    def compute_Refine_POI_reward(self, prompts, completions) -> list[float]:
+        """
+        给定一批次RL生成文本，取数据集中对应顺序的样本，
+        将文本作为messages输入模型进行推理，返回每个样本的sample_f1和类别一致率。
+        """
+        self._lazy_load_data_and_model()
+        msgs = self._tensorize_messages(completions)
+
+        bsz = len(msgs)
+        N = len(self._data)
+        # 取连续下标，必要时取模
+        idxs = [ (self._offset + i) % N for i in range(bsz) ]
+        self._offset = (self._offset + bsz) % N
+
+        loader = self._get_subset_loader(idxs, batch_size=bsz)
+
+        hit_scores: list[float] = []
+        recall_scores: list[float] = []
+        devisity_scores: list[float] = []
+        cat_scores: list[float] = []
+        # 遍历一个batch（期望只有1个，因为batch_size=bsz）
+        with torch.no_grad():
+            for (uid, o_ck, d_ck, masked_d_ck, o_h, d_h, masked_d_h, o_t, d_t, o_l, d_l, o_pad, d_pad, o_rg, d_rg) in loader:
+                # 将messages列表传入forward
+                uid = uid.to(self.device)
+                o_ck = o_ck.to(self.device)
+                masked_d_ck = masked_d_ck.to(self.device)
+                d_ck = d_ck.to(self.device)
+                o_h = o_h.to(self.device)
+                masked_d_h = masked_d_h.to(self.device)
+                d_h = d_h.to(self.device)
+                o_t = o_t.to(self.device)
+                d_t = d_t.to(self.device)
+                o_l = o_l.to(self.device)
+                d_l = d_l.to(self.device)
+                o_pad = o_pad.to(self.device)
+                d_pad = d_pad.to(self.device)
+                o_rg = o_rg.to(self.device)
+                d_rg = d_rg.to(self.device)
+
+                # 预测
+                predicted_ids = self._model(uid, msgs, o_ck, masked_d_ck, o_t, d_t, o_l, d_l, o_pad, d_pad, d_ck, o_rg,
+                                      d_rg, target_seq=None)
+
+
+                # 分样本计算F1
+                for i in range(predicted_ids.shape[0]):
+                    sample_pred = predicted_ids[i].cpu()  # shape: [seq_len]
+                    sample_target = d_ck[i].cpu()  # shape: [seq_len]
+
+                    # Exclude padded values (assuming padding is represented by 0)
+                    non_padded_indices = sample_target != 0
+                    sample_pred = sample_pred[non_padded_indices]
+                    sample_target = sample_target[non_padded_indices]
+                    sample_pred = sample_pred[1:-1]  # Exclude start and end tokens
+                    sample_target = sample_target[1:-1]  # Exclude start and end tokens
+                    hit = hit_rate(sample_pred, sample_target)
+                    hit_scores.append(hit)
+                    # 计算类别一致率
+                    cat_rate = category_consistency_rate(sample_pred, sample_target, self.poi_meta)
+                    cat_scores.append(cat_rate)
+                    recall = recall_rate(sample_pred, sample_target)
+                    recall_scores.append(recall)
+                    diversity = diversity_rate(sample_pred)
+                    devisity_scores.append(diversity)
+
+
+
+        return hit_scores, recall_scores, devisity_scores, cat_scores
 
 def travel_style_f1_reward_func(evaluator: F1RewardEvaluator, prompts, completions, reference_responses, **kwargs) -> list[float]:
     """
@@ -551,7 +625,9 @@ class TravelStyleGRPOTrainer:
                  lora_config: str = None,
                  is_train: bool = True,
                  dataset_name: str = "Yelp",
-                 model_run_name: str = "default"):
+                 model_run_name: str = "default",
+                 is_sft: bool = False,
+                 need_similarity_model: bool = True):
         """
         初始化GRPO训练器
 
@@ -572,12 +648,7 @@ class TravelStyleGRPOTrainer:
         # 用于F1奖励的SPOT-Trip配置
         self.dataset_name = dataset_name
         self.model_run_name = model_run_name
-
-        # 初始化accelerator
-        if self.use_accelerate:
-            self.accelerator = Accelerator()
-        else:
-            self.accelerator = None
+        self.need_similarity_model = need_similarity_model
 
         # 训练进度跟踪
         self.training_progress = None
@@ -585,20 +656,22 @@ class TravelStyleGRPOTrainer:
         self.total_steps = 0
 
         # F1奖励评估器：在cuda:1上提前初始化
-        try:
-            self.f1_evaluator = F1RewardEvaluator(
-                dataset_name=self.dataset_name,
-                run_name=self.model_run_name,
-                device="cuda:1",
-            )
-        except Exception as _e:
-            logger.error(f"预加载F1RewardEvaluator失败: {_e}")
-            self.f1_evaluator = None
+        if not is_sft:
+            try:
+                self.f1_evaluator = F1RewardEvaluator(
+                    dataset_name=self.dataset_name,
+                    run_name=self.model_run_name,
+                    device="cuda:1",
+                )
+            except Exception as _e:
+                logger.error(f"预加载F1RewardEvaluator失败: {_e}")
+                self.f1_evaluator = None
 
         if is_train:
-            from sentence_transformers import SentenceTransformer
             # 初始化相似度模型
-            self.similarity_model = SentenceTransformer(similarity_model_name, device="cuda:2")
+            if not is_sft and need_similarity_model:
+                from sentence_transformers import SentenceTransformer
+                self.similarity_model = SentenceTransformer(similarity_model_name, device="cuda:3")
 
             # 加载tokenizer
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -616,9 +689,11 @@ class TravelStyleGRPOTrainer:
                 self.model = AutoModelForCausalLM.from_pretrained(
                     model_name,
                     device_map="auto",
-                    max_memory={0: "20GiB", 1: "20GiB"},
+                    # max_memory={0: "20GiB", 1: "20GiB"},
                     torch_dtype=torch.bfloat16
                 )
+            for param in self.model.parameters():
+                param.requires_grad = False  # freeze the model - train adapters later
 
             # 配置LoRA
             if self.use_lora:
@@ -630,7 +705,11 @@ class TravelStyleGRPOTrainer:
                         lora_dropout=lora_dropout,
                         task_type="CAUSAL_LM"
                     )
-                self.model = get_peft_model(self.model, self.lora_config)
+                    self.model = get_peft_model(self.model, self.lora_config)
+                else:
+                    from peft import PeftModel
+                    self.model = PeftModel.from_pretrained(self.model, self.lora_config)
+
 
         logger.info("GRPO trainer initialized with LoRA and Accelerate" if (use_lora and self.use_accelerate)
                     else "GRPO trainer initialized with LoRA" if use_lora
@@ -652,10 +731,11 @@ class TravelStyleGRPOTrainer:
               save_steps: int = 250,
               logging_steps: int = 1,
               is_gspo: bool = False,
+              use_Refine_POI_reward: bool = False,
               use_f1_reward: bool = True,
-              acc_reward: float = 1.0,
+              acc_reward: float = 0.1,
               use_category: bool = True,
-              category_reward: float = 1.0,
+              category_reward: float = 0.05,
               ):
         """
         使用GRPO训练模型
@@ -909,6 +989,36 @@ class TravelStyleGRPOTrainer:
                 except Exception:
                     pass
             return scaled
+        def Refine_POI_reward_func(prompts, completions, reference, **kwargs):
+            self.training_progress.set_postfix({
+                'Step': f"{self.current_step}/{self.total_steps}",
+                'Phase': 'F1与类别奖励计算'
+            })
+            if self.f1_evaluator is None:
+                logger.error("F1评估器不可用，返回0奖励")
+                return [0.0 for _ in range(len(completions))]
+            hit_scores, recall_scores, devisity_scores, cat_scores = self.f1_evaluator.compute_Refine_POI_reward(prompts, completions)
+            # 按权重缩放F1奖励
+
+            hit_scaled = [float(r) * 2.0 for r in hit_scores]
+            recall_scaled = [float(r) * 0.5 for r in recall_scores]
+            devisity_scaled = [float(r) * 1.0 for r in devisity_scores]
+            cat_scaled = [float(r) * 0.5 for r in cat_scores]
+            scaled = [h + re + d + c for h, re, d, c in zip(hit_scaled, recall_scaled, devisity_scaled, cat_scaled)]
+            print(f"预测结果奖励均值: {sum(scaled)/len(scaled) if scaled else 0.0:.4f}")
+            if SWANLAB_AVAILABLE:
+                try:
+                    swanlab.log({
+                        "reward/hit": sum(hit_scaled)/len(hit_scaled) if hit_scaled else 0.0,
+                        "reward/recall": sum(recall_scaled)/len(recall_scaled) if recall_scaled else 0.0,
+                        "reward/diversity": sum(devisity_scaled)/len(devisity_scaled) if devisity_scaled else 0.0,
+                        "reward/cat": sum(cat_scaled)/len(cat_scaled) if cat_scaled else 0.0,
+                        "step": self.current_step
+                    })
+                except Exception:
+                    pass
+            return scaled
+
 
         # 创建GRPO训练器
         if self.use_accelerate:
@@ -927,11 +1037,16 @@ class TravelStyleGRPOTrainer:
                 train_dataset=dataset,
             )
         else:
-            reward_list = [similarity_reward_func]
+            if self.need_similarity_model:
+                reward_list = [similarity_reward_func]
+            else:
+                reward_list = []
             if use_f1_reward and use_category:
                 reward_list.append(f1_category_reward_func)
             elif use_f1_reward:
                 reward_list.append(f1_reward_func)
+            if use_Refine_POI_reward:
+                reward_list = [Refine_POI_reward_func]
             trainer = GRPOTrainer(
                 model=self.model,
                 processing_class=self.tokenizer,
@@ -998,6 +1113,169 @@ class TravelStyleGRPOTrainer:
         print(f"GRPO强化学习训练完成!")
         print(f"{'=' * 100}\n")
 
+    # ================= Supervised Fine-Tuning (SFT) ================= #
+    def sft(self,
+            text_dataset=None,
+            output_dir: str = "./sft_travel_style_lora",
+            run_name: str = "travel_style_sft",
+            num_train_epochs: int = 2,
+            learning_rate: float = 2e-5,
+            per_device_train_batch_size: int = 1,
+            gradient_accumulation_steps: int = 8,
+            max_seq_length: int = 2048,
+            logging_steps: int = 10,
+            save_steps: int = 500,
+            packing: bool = False,
+            swanlab_project: str = "travel-style-sft",
+            enable_swanlab: bool = True,
+            use_accelerate: bool = False
+            ):
+        """对LLM进行有监督微调 (Supervised Fine-Tuning)。
+
+        要求数据集中含有以下字段：
+            - prompt: 输入提示 (str)
+            - reference: 目标输出 (str)
+
+        训练完成后仅保存 LoRA 适配器参数（如果开启 LoRA），保持基座模型路径不变。
+
+        Args:
+            text_dataset: HuggingFace datasets 或 List[Dict]，包含 prompt/reference
+            output_dir: LoRA 适配器保存目录
+            run_name: 运行名称
+            num_train_epochs: 训练轮数
+            learning_rate: 学习率
+            per_device_train_batch_size: 每设备 batch size
+            gradient_accumulation_steps: 梯度累积
+            max_seq_length: 最大序列长度（截断）
+            logging_steps: 日志步频
+            save_steps: 保存步频
+            packing: 是否启用多样本打包（SFTTrainer参数）
+        """
+
+        logger.info("开始 SFT 微调 ...")
+        print(f"\n{'=' * 90}\n开始监督微调 (SFT)\n{'=' * 90}")
+
+        from datasets import Dataset
+        def prepare_dataset(ds):
+
+            """
+            ds: 一个 HuggingFace Dataset 对象，包含 "prompt" 和 "reference" 两列
+
+            返回：一个 transform 后的 dataset，其每条 record 包含 "prompt" 和 "completion" 或者直接是拼接好的文本，满足 SFTTrainer 期待的格式
+            """
+            def convert_example(ex):
+                # 这里把 prompt + reference 转成 SFTTrainer 可接受的格式
+                # TRL 支持 “{"prompt": ..., "completion": ...}” 格式 :contentReference[oaicite:1]{index=1}
+                return {
+                    "prompt": ex["prompt"],
+                    "completion": ex["reference"],
+                }
+
+            new_ds = ds.map(convert_example, remove_columns=[col for col in ds.column_names if col not in ("prompt", "reference")])
+            return new_ds
+
+        formatted_dataset = prepare_dataset(text_dataset)
+
+        # 构造 TrainingArguments (与 GRPO 分离，避免冲突)
+        from transformers import TrainingArguments
+        sft_args = TrainingArguments(
+            output_dir=output_dir,
+            run_name=run_name,
+            num_train_epochs=num_train_epochs,
+            per_device_train_batch_size=per_device_train_batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            learning_rate=learning_rate,
+            logging_steps=logging_steps,
+            save_steps=save_steps,
+            bf16=True,
+            report_to=[]  # 禁用wandb等
+        )
+
+        # 创建 SFTTrainer
+        # SwanLab 回调（仅在可用且启用时）
+        swanlab_callback = None
+        if enable_swanlab and SWANLAB_AVAILABLE:
+            try:
+                class SwanLabSFTCallback(TrainerCallback):
+                    def __init__(self):
+                        self.started = False
+                    def on_train_begin(self, args, state, control, **kwargs):
+                        if not self.started:
+                            swanlab.log({"event": "sft_train_begin", "total_steps": state.max_steps})
+                            self.started = True
+                    def on_log(self, args, state, control, logs=None, **kwargs):
+                        if logs:
+                            # 过滤掉不适合的对象类型
+                            safe_logs = {k: float(v) for k, v in logs.items() if isinstance(v, (int, float))}
+                            if safe_logs:
+                                swanlab.log({f"sft/{k}": v for k, v in safe_logs.items()})
+                    def on_step_end(self, args, state, control, **kwargs):
+                        if state.global_step % max(1, logging_steps) == 0:
+                            swanlab.log({"sft/step": state.global_step, "sft/epoch_progress": state.epoch or 0})
+                    def on_train_end(self, args, state, control, **kwargs):
+                        swanlab.log({"event": "sft_train_end", "final_step": state.global_step, "final_epoch": state.epoch or 0})
+                swanlab.init(project=swanlab_project, experiment_name=run_name, config={
+                    "mode": "sft",
+                    "model_name": self.model_name,
+                    "use_lora": self.use_lora,
+                    "epochs": num_train_epochs,
+                    "lr": learning_rate,
+                    "batch_size": per_device_train_batch_size,
+                    "grad_accum": gradient_accumulation_steps,
+                    "max_seq_length": max_seq_length,
+                    "samples": len(text_dataset)
+                })
+                swanlab_callback = SwanLabSFTCallback()
+            except Exception as e:
+                logger.warning(f"SwanLab 初始化失败，继续训练: {e}")
+                swanlab_callback = None
+
+        sft_trainer = SFTTrainer(
+            model=self.model,
+            train_dataset=formatted_dataset,
+            args=sft_args,
+            callbacks=[swanlab_callback] if swanlab_callback else None,
+        )
+        # SFTTrainer 内部会处理 accelerator
+        # sft_trainer, formatted_dataset = self.accelerator.prepare(sft_trainer, formatted_dataset)
+
+        logger.info("SFT Trainer 初始化完成，开始训练 ...")
+        print(f"样本数: {len(formatted_dataset)} | 轮数: {num_train_epochs} | batch: {per_device_train_batch_size} | 累积: {gradient_accumulation_steps}")
+        try:
+            sft_trainer.train()
+        except Exception as e:
+            logger.error(f"SFT 训练失败: {e}")
+            raise
+
+        # 仅保存 LoRA 适配器
+        os.makedirs(output_dir, exist_ok=True)
+        if self.use_lora:
+            try:
+                self.model.save_pretrained(output_dir)
+                logger.info(f"LoRA 适配器已保存到 {output_dir}")
+            except Exception as e:
+                logger.error(f"保存 LoRA 适配器失败: {e}")
+                raise
+        else:
+            # 如果未使用LoRA，也保存整个模型（用户要求保持路径不变，此处给出提示）
+            self.model.save_pretrained(output_dir)
+            logger.info(f"未使用LoRA，已保存全量模型到 {output_dir}")
+
+        # 保存 tokenizer（可选）
+        try:
+            self.tokenizer.save_pretrained(output_dir)
+        except Exception:
+            pass
+
+        print(f"\n✅ SFT 完成，适配器保存在: {output_dir}\n")
+        if enable_swanlab and SWANLAB_AVAILABLE:
+            try:
+                swanlab.log({"sft/adapter_saved": True, "sft/adapter_path": output_dir})
+                print("SwanLab 日志已更新。查看命令示例 (本地 UI)：\n  swanlab board\n或在项目面板中筛选 experiment_name=", run_name)
+            except Exception:
+                pass
+        return output_dir
+
 
 def main():
     """主函数 - 演示使用方法"""
@@ -1006,42 +1284,87 @@ def main():
     wandb.init(mode="disabled")  # 强制禁用 wandb
     parser = argparse.ArgumentParser()
     parser.add_argument("--use_accelerate", action="store_true", help="是否使用accelerate加速")
+    # SFT 相关
+    parser.add_argument("--sft", action="store_true", help="是否执行监督微调 (SFT)")
+    parser.add_argument("--sft_epochs", type=int, default=1, help="SFT 训练轮数")
+    parser.add_argument("--sft_lr", type=float, default=2e-5, help="SFT 学习率")
+    parser.add_argument("--sft_batch", type=int, default=2, help="SFT per-device batch size")
+    parser.add_argument("--sft_grad_accum", type=int, default=4, help="SFT 梯度累积步数")
+    parser.add_argument("--sft_max_len", type=int, default=2048, help="SFT 最大序列长度")
+    parser.add_argument("--sft_output", type=str, default="./sft_travel_style_lora", help="SFT LoRA保存目录")
+    parser.add_argument("--sft_run_name", type=str, default="travel_style_sft", help="SFT 运行名称")
+    parser.add_argument("--sft_project", type=str, default="travel-style-sft", help="SwanLab 项目名称")
+    parser.add_argument("--no_swanlab", action="store_true", help="禁用 SFT 中的 SwanLab 日志")
+    parser.add_argument("--dataset_name", type=str, default="Foursquare", help="数据集名称(Foursquare/Yelp)")
     args = parser.parse_args()
-    dataset_name = "Foursquare"
+    dataset_name = args.dataset_name
+    args.sft_output = args.sft_output + f"_{dataset_name}_sftepoch1"
+    args.sft_project = args.sft_project + f"_{dataset_name}_sftepoch1"
+    args.sft_run_name = args.sft_run_name + f"_{dataset_name}_sftepoch1"
     # 初始化训练器（使用LoRA和accelerate）
+
+    from datasets import load_from_disk
+    if dataset_name == "Foursquare":
+        text_dataset = load_from_disk("../dataset/travel_dataset_20250712_201017")
+        output_dir = "./sft_grpo_Foursquare_f1_RefinePOI"
+        run_name = "Foursquare_sft_grpo_RefinePOI"
+        lora_config = "./sft_travel_style_lora_Foursquare_sftepoch1/checkpoint-376"
+    else:
+        text_dataset = load_from_disk("../dataset/Yelp_20250714_192438")
+        output_dir = "./sft_grpo_Yelp_f1_epoch1_RefinePOI"
+        run_name = "Yelp_sft_grpo_epoch1_RefinePOI"
+        lora_config = "./sft_travel_style_lora_Yelp_sftepoch1/checkpoint-553"
     trainer = TravelStyleGRPOTrainer(
         model_name="../LLMs/Qwen3-8B",
         model_run_name=dataset_name + "_semantic8_diversity0.1_attnreg0.1_mask0.75",
         dataset_name=dataset_name,
         use_lora=True,
+        lora_config=lora_config if not args.sft else None,
         lora_r=16,
         lora_alpha=32,
-        use_accelerate=args.use_accelerate  # 启用accelerate支持
+        is_sft=args.sft,
+        use_accelerate=args.use_accelerate,  # 启用accelerate支持
+        need_similarity_model=False
     )
 
-    # 准备训练和测试数据
-    from datasets import load_from_disk
-    if dataset_name == "Foursquare":
-        text_dataset = load_from_disk("../dataset/travel_dataset_20250712_201017")
-        output_dir = "./grpo_Foursquare_f1_cat_0.75_0.1_8_lora_model"
-        run_name = "Foursquare_grpo_f1_cat_0.75_0.1_8"
+    if args.sft:
+        adapter_dir = trainer.sft(
+            text_dataset=text_dataset,
+            output_dir=args.sft_output,
+            run_name=args.sft_run_name,
+            num_train_epochs=args.sft_epochs,
+            learning_rate=args.sft_lr,
+            per_device_train_batch_size=args.sft_batch,
+            gradient_accumulation_steps=args.sft_grad_accum,
+            max_seq_length=args.sft_max_len,
+            enable_swanlab=not args.no_swanlab,
+            swanlab_project=args.sft_project,
+        )
+        # 打印 SwanLab 查看命令
+        if not args.no_swanlab and SWANLAB_AVAILABLE:
+            print("\n=== SwanLab 查看方式 ===")
+            print("1) 启动本地面板: swanlab board")
+            print(f"2) 进入项目: {args.sft_project}")
+            print(f"3) 过滤 experiment_name == {args.sft_run_name}")
+            print("4) 关键指标前缀: sft/* \n")
+            print(f"LoRA 适配器路径: {adapter_dir}")
+        else:
+            print("SwanLab 未启用或不可用，跳过日志查看说明。")
     else:
-        text_dataset = load_from_disk("../dataset/Yelp_20250714_192438")
-        output_dir = "./grpo_Yelp_f1_cat_0.75_0.1_8_lora_model"
-        run_name = "Yelp_style_f1_cat_0.75_0.1_8"
+        # 默认 GRPO 训练流程
 
-    # 训练模型
-    trainer.train(
-        text_dataset=text_dataset,
-        output_dir=output_dir,
-        run_name=run_name,
-        num_train_epochs=3,
-        per_device_train_batch_size=1,  # 减小批次大小适应示例数据
-        gradient_accumulation_steps=8,
-        use_category=True,
-        use_f1_reward=True,
-        is_gspo=False
-    )
+        trainer.train(
+            text_dataset=text_dataset,
+            output_dir=output_dir,
+            run_name=run_name,
+            num_train_epochs=1,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=8,
+            use_Refine_POI_reward=True,
+            use_category=True,
+            use_f1_reward=True,
+            is_gspo=False
+        )
 
     # 评估模型
     # results = trainer.evaluate(test_trajectories)

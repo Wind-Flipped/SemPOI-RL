@@ -501,3 +501,10 @@ def centroid_geo_distance(predict: torch.Tensor, target: torch.Tensor, poi_meta:
     if c_p is None or c_t is None:
         return float('nan')
     return _haversine(c_p[0], c_p[1], c_t[0], c_t[1])
+
+def diversity_rate(predict: torch.Tensor) -> float:
+    """多样性: 预测序列中不同 POI 的比例。"""
+    p_list = predict.tolist()
+    if not p_list:
+        return float('nan')
+    return len(set(p_list)) / len(p_list)

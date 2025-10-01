@@ -1,8 +1,8 @@
 #!/bin/bash
 
-num_semantic_parts=(4 8 16)
-lambda_diversity_params=(0.05 0.1 0.2)
-mask_ratios=(0.75)
+num_semantic_parts=(0)
+lambda_diversity_params=(0.1)
+mask_ratios=(0.25 0.5 0.75)
 #dataset_name="Foursquare"
 #
 #for mask_ratio in "${mask_ratios[@]}"; do
@@ -32,17 +32,17 @@ mask_ratios=(0.75)
 #done
 
 
-dataset_name="Yelp"
+dataset_name="Foursquare"
 for mask_ratio in "${mask_ratios[@]}"; do
   # 遍历num_semantic_parts数组
     for num_parts in "${num_semantic_parts[@]}"; do
         # 遍历lambda_diversity数组
         for lambda in "${lambda_diversity_params[@]}"; do
             # 构造日志文件路径（包含两个参数值）
-            log_file="../new_results_${dataset_name}11/${dataset_name}_mask${mask_ratio}_${num_parts}_lambda_${lambda}.log"
+            log_file="../new_results_${dataset_name}12/${dataset_name}_mask${mask_ratio}_${num_parts}_lambda_${lambda}.log"
 
             # 确保结果目录存在
-            mkdir -p "../new_results_${dataset_name}11"
+            mkdir -p "../new_results_${dataset_name}12"
 
             # 打印当前运行的信息（可选）
             echo "Running experiment with mask_ratio = $mask_ratio, num_semantic_parts=$num_parts, lambda_diversity=$lambda, logging to $log_file"

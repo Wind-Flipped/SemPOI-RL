@@ -134,10 +134,15 @@ def main():
     elif args.dataset_name == 'Yelp':
         args.dataset_path = '../dataset/Yelp_20250714_192438'
     set_seeds(args.seed)
-    args.name = (args.dataset_name + "_semantic" + str(args.num_semantic_parts) + "_diversity" + str(args.lambda_diversity)
-            + "_attnreg" + str(args.lambda_attn_reg) + "_mask" + str(args.mask_ratio))
-    args.save_path = os.path.join(args.save_path, args.name)
-    path_exist(args.save_path)
+    if args.model == 'SPOT-Trip':
+        args.name = (args.dataset_name + "_semantic" + str(args.num_semantic_parts) + "_diversity" + str(args.lambda_diversity)
+                + "_attnreg" + str(args.lambda_attn_reg) + "_mask" + str(args.mask_ratio))
+        args.save_path = os.path.join(args.save_path, args.name)
+        path_exist(args.save_path)
+    elif args.model == 'AR-Trip':
+        args.name = (args.dataset_name + "_model_" + str(args.model))
+        args.save_path = os.path.join(args.save_path, args.name)
+        path_exist(args.save_path)
 
     # Initializing a Logger instance for recording various metrics during the training process
     # args.log_path: Path where the log file is saved

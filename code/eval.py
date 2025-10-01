@@ -56,7 +56,7 @@ def main():
     parser.add_argument('--mode', type=str, default='train')
     parser.add_argument('--train_batch', type=int, default=4)
     parser.add_argument('--save_step', type=int, default=1)
-    parser.add_argument('--test_batch', type=int, default=1)
+    parser.add_argument('--test_batch', type=int, default=4)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--hidden_size', type=int, default=128)
     parser.add_argument("--projection_dim", type=int, default=64)
@@ -114,7 +114,7 @@ def main():
     parser.add_argument("--use_vllm", action="store_true", help="Use vllm for training")
     parser.add_argument("--llm_embedding_dim", type=int, default=256, help="Embedding dimension for LLM")
     parser.add_argument("--use_lora", action="store_true", help="Use LLM trained with LoRA for training")
-    parser.add_argument("--lora_path", type=str, default="./grpo_Foursquare_f1_cat_0.75_0.1_8_lora_model/checkpoint-4509",
+    parser.add_argument("--lora_path", type=str, default="./grpo_Yelp_f1_cat_0.75_0.1_8_lora_model/checkpoint-2250",
                         help="Path to the LoRA model")
     parser.add_argument("--dataset_path", type=str, default="../dataset/Yelp_20250714_192438",
                         help="Path to the dataset for LLM training")
@@ -126,7 +126,7 @@ def main():
     parser.add_argument("--lambda_attn_reg", type=float, default=0.1,
                         help="Weight for attention regulation loss in MAE.")
     parser.add_argument("--mask_ratio", type=float, default=0.5, help="Mask ratio for MAE.")
-
+    parser.add_argument("--eval_dataset", type=str, default="test")
     # Yelp: ../dataset/Yelp_20250714_192438
     # Foursquare: ../dataset/travel_dataset_20250712_201017
     # Parsing command-line arguments
@@ -140,8 +140,26 @@ def main():
     args.save_path = f'../{args.dataset_name}/model_save'
     if args.dataset_name == 'Foursquare':
         args.dataset_path = '../dataset/travel_dataset_20250712_201017'
+        # 强化学习后的路径
+        # args.lora_path = "./sft_grpo_Foursquare_f1_cat_0.75_0.1_8_lora_model/checkpoint-1503"
+        # 强化学习1轮后的路径
+        # args.lora_path = "./sft_grpo_Foursquare_f1_epoch1/checkpoint-1503"
+        # 只有SFT的路径
+        # args.lora_path = "./sft_travel_style_lora/checkpoint-752"
+        # 只有SFT1轮的路径
+        args.lora_path = "./sft_travel_style_lora_Foursquare_sftepoch1/checkpoint-376"
     elif args.dataset_name == 'Yelp':
         args.dataset_path = '../dataset/Yelp_20250714_192438'
+        # 强化学习2轮后的路径
+        # args.lora_path = "./sft_grpo_Yelp_f1_cat_0.75_0.1_8_lora_model/checkpoint-2208"
+        # 强化学习1轮后的路径
+        # args.lora_path = "./sft_grpo_Yelp_f1_epoch1/checkpoint-2208"
+        # 只有SFT的路径
+        # args.lora_path = "./sft_travel_style_lora_Yelp/checkpoint-4418"
+        # 只有SFT1轮的路径
+        # args.lora_path = "./sft_travel_style_lora_Yelp_sftepoch1/checkpoint-553"
+        # 使用了真实的f1-score
+        args.lora_path = "./sft_grpo_Yelp_f1_epoch1_withRealf1"
     set_seeds(args.seed)
     args.name = (args.dataset_name + "_semantic" + str(args.num_semantic_parts) + "_diversity" + str(
         args.lambda_diversity)
@@ -179,10 +197,15 @@ def main():
 
     model = SPOTModel(args, len(data.poi_idx) + 1, data.region_poi, max_d_length, max_o_length,
                           d_model=args.hidden_size, n_head=4, num_encoder_layers=1, d_z=args.hidden_size,
-                          kg_dataset=kg_data).to(args.device)
-
-    test(model, os.path.join(args.save_path, "model_0.xhr"), valid_loader, args, logger, n_region)
-
+                          kg_dataset=kg_data)
+    if args.dataset_name == "Yelp" and args.eval_dataset == "test":
+        test(model, os.path.join(args.save_path, "model_5.xhr"), test_loader, args, logger, n_region)
+    elif args.dataset_name == "Foursquare" and args.eval_dataset == "test":
+        test(model, os.path.join(args.save_path, "model_0.xhr"), test_loader, args, logger, n_region)
+    elif args.dataset_name == "Yelp" and args.eval_dataset == "valid":
+        test(model, os.path.join(args.save_path, "model_5.xhr"), valid_loader, args, logger, n_region)
+    elif args.dataset_name == "Foursquare" and args.eval_dataset == "valid":
+        test(model, os.path.join(args.save_path, "model_0.xhr"), valid_loader, args, logger, n_region)
     logger.close_log()
 
 

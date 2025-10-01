@@ -967,6 +967,8 @@ class SPOTModel(nn.Module):
                 generated_texts = messages
             else:
                 generated_texts = self.travel_style_generator.get_output(messages, max_length=512, temperature=0.7)
+            print("UID:", uid)
+            print("Generated Texts:", generated_texts)
             # 2. 获取生成文本的embedding（截断到self.hidden_size维）
             generated_embeddings = self.travel_style_reward_calculator.get_embedding(generated_texts,
                                                                                      embedding_dim=self.llm_embedding_dim)

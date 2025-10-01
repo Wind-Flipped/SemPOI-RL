@@ -98,6 +98,9 @@ class TravelStyleGenerator:
                 device_map="auto",
                 torch_dtype=torch.bfloat16
             )
+            for param in self.model.parameters():
+                param.requires_grad = False  # freeze the model - train adapters later
+
             if use_lora:
                 try:
                     from peft import PeftModel
@@ -220,7 +223,7 @@ class TravelStyleRewardCalculator:
         Args:
             similarity_model: 用于计算文本相似度的模型
         """
-        self.similarity_model = SentenceTransformer(similarity_model, device="cuda:3")
+        self.similarity_model = SentenceTransformer(similarity_model, device="cuda:2")
         logger.info(f"Reward calculator initialized with {similarity_model}")
 
     def calculate_similarity(self, text1: str, text2: str) -> float:
@@ -504,6 +507,9 @@ class TravelStyleGRPOTrainer:
                     max_memory={0: "20GiB", 1: "20GiB", 2: "0GiB"},
                     torch_dtype=torch.bfloat16
                 )
+            for param in self.model.parameters():
+                param.requires_grad = False  # freeze the model - train adapters later
+
 
             # 配置LoRA
             if self.use_lora:
