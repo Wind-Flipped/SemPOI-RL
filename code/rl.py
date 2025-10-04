@@ -251,8 +251,10 @@ class F1RewardEvaluator:
         base = os.path.abspath(os.path.join(os.path.dirname(__file__), f"../{self.dataset_name}/model_save/{self.run_name}"))
         if not os.path.isdir(base):
             raise FileNotFoundError(f"未找到模型目录: {base}")
-        # 使用model_0.xhr # TODO
-        best = os.path.join(base, "model_5.xhr")
+        if self.dataset_name == "Foursquare":
+            best = os.path.join(base, "model_0.xhr")
+        else:
+            best = os.path.join(base, "model_5.xhr")
         if os.path.exists(best):
             return best
         else:
@@ -708,7 +710,16 @@ class TravelStyleGRPOTrainer:
                     self.model = get_peft_model(self.model, self.lora_config)
                 else:
                     from peft import PeftModel
-                    self.model = PeftModel.from_pretrained(self.model, self.lora_config)
+                    self.model = PeftModel.from_pretrained(self.model, self.lora_config, is_trainable=False)
+                    # Add a new lora adapter
+                    self.lora_config = LoraConfig(
+                        r=lora_r,
+                        lora_alpha=lora_alpha,
+                        target_modules=["q_proj", "v_proj"],
+                        lora_dropout=lora_dropout,
+                        task_type="CAUSAL_LM"
+                    )
+                    self.model = get_peft_model(self.model, self.lora_config)
 
 
         logger.info("GRPO trainer initialized with LoRA and Accelerate" if (use_lora and self.use_accelerate)
@@ -1306,13 +1317,13 @@ def main():
     from datasets import load_from_disk
     if dataset_name == "Foursquare":
         text_dataset = load_from_disk("../dataset/travel_dataset_20250712_201017")
-        output_dir = "./sft_grpo_Foursquare_f1_RefinePOI"
-        run_name = "Foursquare_sft_grpo_RefinePOI"
+        output_dir = "./sft_grpo_Foursquare_f1_RefinePOI_newlora"
+        run_name = "Foursquare_sft_grpo_RefinePOI_newlora"
         lora_config = "./sft_travel_style_lora_Foursquare_sftepoch1/checkpoint-376"
     else:
         text_dataset = load_from_disk("../dataset/Yelp_20250714_192438")
-        output_dir = "./sft_grpo_Yelp_f1_epoch1_RefinePOI"
-        run_name = "Yelp_sft_grpo_epoch1_RefinePOI"
+        output_dir = "./sft_grpo_Yelp_f1_epoch1_RefinePOI_newlora"
+        run_name = "Yelp_sft_grpo_epoch1_RefinePOI_newlora"
         lora_config = "./sft_travel_style_lora_Yelp_sftepoch1/checkpoint-553"
     trainer = TravelStyleGRPOTrainer(
         model_name="../LLMs/Qwen3-8B",

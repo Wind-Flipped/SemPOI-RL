@@ -561,6 +561,9 @@ def get_test_result(model, test_loader, args, logger, prompts, references, poi_m
             # Extract the prediction and target for the current sample
             sample_pred = predicted_ids[i].cpu()  # shape: [seq_len]
             sample_target = d_ck[i].cpu()  # shape: [seq_len]
+            print("UIDs:", uid[i].cpu().item())
+            print("Predicted IDs:", sample_pred.tolist())
+            print("Target IDs:", sample_target.tolist())
 
             # Exclude padded values (assuming padding is represented by 0)
             non_padded_indices = sample_target != 0
@@ -741,6 +744,9 @@ def test(model, model_path, test_loader, args, logger, n_region, train_am=None, 
             # Extract the prediction and target for the current sample
             sample_pred = predicted_ids[i].cpu()  # shape: [seq_len]
             sample_target = d_ck[i].cpu()  # shape: [seq_len]
+            print("UIDs:", uid[i].cpu().item())
+            print("Predicted IDs:", sample_pred.tolist())
+            print("Target IDs:", sample_target.tolist())
 
             # Exclude padded values (assuming padding is represented by 0)
             non_padded_indices = sample_target != 0

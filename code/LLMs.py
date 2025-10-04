@@ -57,7 +57,9 @@ logger = logging.getLogger(__name__)
 class TravelStyleGenerator:
     """旅游风格生成器 - 封装LLM调用"""
     
-    def __init__(self, model_name: str = "../LLMs/Qwen3-8B", device: str = "cuda", use_vllm=False, use_lora=False, lora_path: str = "./grpo_travel_style_lora_model/checkpoint-5500"):
+    def __init__(self, model_name: str = "../LLMs/Qwen3-8B", device: str = "cuda",
+                 use_vllm=False, use_lora=False, lora_path: str = "./grpo_travel_style_lora_model/checkpoint-5500",
+                 lora_path2=None):
         """
         初始化旅游风格生成器
 
@@ -104,7 +106,10 @@ class TravelStyleGenerator:
             if use_lora:
                 try:
                     from peft import PeftModel
-                    self.model = PeftModel.from_pretrained(self.model, lora_path)
+                    self.model = PeftModel.from_pretrained(self.model, lora_path, is_trainable=False)
+                    # 2 Lora configs
+                    if lora_path2 is not None:
+                        self.model = PeftModel.from_pretrained(self.model, lora_path2, is_trainable=False)
                     logger.info(f"LoRA parameters loaded from {lora_path} and merged with base model.")
                 except Exception as e:
                     logger.error(f"Failed to load LoRA parameters: {e}")

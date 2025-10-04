@@ -116,6 +116,7 @@ def main():
     parser.add_argument("--use_lora", action="store_true", help="Use LLM trained with LoRA for training")
     parser.add_argument("--lora_path", type=str, default="./grpo_Yelp_f1_cat_0.75_0.1_8_lora_model/checkpoint-2250",
                         help="Path to the LoRA model")
+    parser.add_argument("--lora_path2", type=str, default=None)
     parser.add_argument("--dataset_path", type=str, default="../dataset/Yelp_20250714_192438",
                         help="Path to the dataset for LLM training")
     parser.add_argument("--st_module", action="store_true", help="use SpatialTemporal module")
@@ -148,6 +149,9 @@ def main():
         # args.lora_path = "./sft_travel_style_lora/checkpoint-752"
         # 只有SFT1轮的路径
         args.lora_path = "./sft_travel_style_lora_Foursquare_sftepoch1/checkpoint-376"
+        # 使用Refine-POI的reward
+        # args.lora_path = "./sft_grpo_Foursquare_f1_RefinePOI"
+        args.lora_path2 = "./sft_grpo_Foursquare_f1_RefinePOI_newlora"
     elif args.dataset_name == 'Yelp':
         args.dataset_path = '../dataset/Yelp_20250714_192438'
         # 强化学习2轮后的路径
@@ -160,6 +164,9 @@ def main():
         # args.lora_path = "./sft_travel_style_lora_Yelp_sftepoch1/checkpoint-553"
         # 使用了真实的f1-score
         args.lora_path = "./sft_grpo_Yelp_f1_epoch1_withRealf1"
+        # 使用Refine-POI的reward
+        # args.lora_path = "./sft_grpo_Yelp_f1_epoch1_RefinePOI"
+        args.lora_path2 = "./sft_grpo_Yelp_f1_epoch1_RefinePOI_newlora"
     set_seeds(args.seed)
     args.name = (args.dataset_name + "_semantic" + str(args.num_semantic_parts) + "_diversity" + str(
         args.lambda_diversity)

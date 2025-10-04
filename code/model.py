@@ -433,7 +433,7 @@ class SPOTModel(nn.Module):
         # initial LLMs
         self.travel_style_reward_calculator = TravelStyleRewardCalculator()
         if args.use_llm and not args.use_target_llm:
-            self.travel_style_generator = TravelStyleGenerator(use_vllm=args.use_vllm, use_lora=args.use_lora, lora_path=args.lora_path)
+            self.travel_style_generator = TravelStyleGenerator(use_vllm=args.use_vllm, use_lora=args.use_lora, lora_path=args.lora_path, lora_path2=args.lora_path2)
         # initial hyperparameter
         self.hidden_size = d_model
         self.args = args
