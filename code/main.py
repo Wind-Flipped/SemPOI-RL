@@ -27,8 +27,7 @@ except:
 
 from utils import *
 from data import TravelDataset, random_split, KGDataset
-from ARmodel import ARModel
-from model import SPOTModel
+from model import SemPOIModel
 import metrics
 from trainer import *
 
@@ -49,7 +48,6 @@ def main():
     parser.add_argument('--data_split_path', type=str, default=f'../{dataset_name}/data_split.pkl')
 
     # Training Configurations
-    parser.add_argument('--model', type=str, default='SPOT-Trip')
     parser.add_argument('--mode', type=str, default='train')
     parser.add_argument('--train_batch', type=int, default=4)
     parser.add_argument('--save_step', type=int, default=1)
@@ -71,33 +69,6 @@ def main():
     parser.add_argument('--device', type=str, default="cuda:0")
     parser.add_argument("--stop_epoch", type=int, default=2) # early stopping
     parser.add_argument("--fine_stop", type=int, default=12)
-
-    # Knowledge Graph (KG) Arguments
-    parser.add_argument("--segments", type=int, default=16)
-    parser.add_argument("--kg", action="store_true")
-    parser.add_argument("--entity_num_per_poi", type=int, default=2) # Note: F 2 For Yelp, use 10
-    parser.add_argument("--train_trans", action="store_true")
-    parser.add_argument('--trans', type=str, default="transe")
-    parser.add_argument("--contrast", action="store_true")
-    parser.add_argument("--kgcn", type=str, default="RGAT")
-    parser.add_argument("--kg_p_drop", type=float, default=0.5)
-    parser.add_argument("--ui_p_drop", type=float, default=0.1)
-    parser.add_argument("--tau", type=float, default=0.2)
-
-    # AR-Trip
-    parser.add_argument("--drifting", action="store_true")
-    parser.add_argument("--guiding", action="store_true")
-    parser.add_argument("--repetition_beta", type=float, default=1.0)
-    parser.add_argument("--train_type", type=str, default='Penalty')
-    parser.add_argument('--confidence', type=float, default=0.5)
-    # ODE
-    parser.add_argument("--ode", action="store_true")
-    parser.add_argument("--t_unif_res", type=int, default=10, help="Number of point in unfirom temporal grid used for intepolation.")
-    parser.add_argument("--solver", type=str, default="dopri5", help="Name of the ODE solver (see torchdiffeq).")
-    parser.add_argument("--rtol", type=float, default=1e-5, help="Relative tolerance for ODE solver.")
-    parser.add_argument("--atol", type=float, default=1e-5, help="Absolute tolerance for ODE solver.")
-    parser.add_argument("--dyn_hid_layers", type=int, default=3, help="Number of hidden layers in dynamics function.")
-    parser.add_argument("--dyn_latent_dim", type=int, default=128, help="Hidden layer dimension in dynamics function.")
     # Model (lm).
     parser.add_argument("--lm_hid_layers", type=int, default=3, help="Number of hidden layers in intensity function.")
     parser.add_argument("--lm_latent_dim", type=int, default=128, help="Hidden layer dimension in intensity function.")
@@ -118,9 +89,6 @@ def main():
     parser.add_argument("--lambda_attn_reg", type=float, default=0.1, help="Weight for attention regulation loss in MAE.")
     parser.add_argument("--mask_ratio", type=float, default=0.5, help="Mask ratio for MAE.")
 
-    # Yelp: ../dataset/Yelp_20250714_192438
-    # Foursquare: ../dataset/travel_dataset_20250712_201017
-    # Parsing command-line arguments
     args = parser.parse_args()
     args.ori_data = f'../{args.dataset_name}/home.txt'
     args.dst_data = f'../{args.dataset_name}/oot.txt'
@@ -134,34 +102,17 @@ def main():
     elif args.dataset_name == 'Yelp':
         args.dataset_path = '../dataset/Yelp_20250714_192438'
     set_seeds(args.seed)
-    if args.model == 'SPOT-Trip':
-        args.name = (args.dataset_name + "_semantic" + str(args.num_semantic_parts) + "_diversity" + str(args.lambda_diversity)
-                + "_attnreg" + str(args.lambda_attn_reg) + "_mask" + str(args.mask_ratio))
-        args.save_path = os.path.join(args.save_path, args.name)
-        path_exist(args.save_path)
-    elif args.model == 'AR-Trip':
-        args.name = (args.dataset_name + "_model_" + str(args.model))
-        args.save_path = os.path.join(args.save_path, args.name)
-        path_exist(args.save_path)
+    args.name = (args.dataset_name + "_semantic" + str(args.num_semantic_parts) + "_diversity" + str(args.lambda_diversity)
+            + "_attnreg" + str(args.lambda_attn_reg) + "_mask" + str(args.mask_ratio))
+    args.save_path = os.path.join(args.save_path, args.name)
+    path_exist(args.save_path)
 
-    # Initializing a Logger instance for recording various metrics during the training process
-    # args.log_path: Path where the log file is saved
-    # args.name: Name of the model, used in the log
-    # args.seed: Random seed value, also recorded in the log
-    # args.log: A boolean value indicating whether to output logs to the console
     logger = Logger(args.log_path, args.name, args.seed, args.log)
     logger.log(str(args))
     logger.log("Experiment name: %s" % args.name)
 
-
-    # Loading the travel dataset with parameters and data paths specified in args
     data = TravelDataset(args, args.ori_data, args.dst_data, args.trans_data)
 
-    # Checking if the knowledge graph (KG) option is enabled and loading KG data accordingly
-    if args.kg:
-        kg_data = KGDataset(args)
-    else:
-        kg_data = None
     train_data, valid_data, test_data = random_split(data, dataset_name=dataset_name, split_path=args.data_split_path)
 
     train_loader = DataLoader(train_data, args.train_batch, shuffle=True, collate_fn=collate_fn)
@@ -172,29 +123,16 @@ def main():
     max_d_length = max(len(seq) for seq in data.dsts)
     max_o_length = max(len(seq) for seq in data.oris)
 
-    if args.model == 'SPOT-Trip':
-        model = SPOTModel(args, len(data.poi_idx) + 1, data.region_poi, max_d_length, max_o_length,
-                          d_model=args.hidden_size, n_head=4, num_encoder_layers=1, d_z=args.hidden_size, kg_dataset=kg_data).to(args.device)
-        train_am = None
-        train_pm = None
+    model = SemPOIModel(args, len(data.poi_idx) + 1, data.region_poi, max_d_length, max_o_length,
+                        d_model=args.hidden_size, n_head=4, num_encoder_layers=1, d_z=args.hidden_size, kg_dataset=kg_data).to(args.device)
+
     # Training or testing the model based on the mode specified in args
-    elif args.model == 'AR-Trip':
-        train_am = poi_adjacent(train_data, len(data.poi_idx) + 1)
-        train_pm, confidence = poi_position(train_data, len(data.poi_idx) + 1, max_d_length)
-        train_am = torch.tensor(train_am).to(args.device)
-        train_pm = torch.tensor(train_pm).to(args.device)
-        args.confidence = confidence
-        model = ARModel(args, len(data.poi_idx) + 1, 25, args.drifting, args.guiding, data.region_poi,
-                         args.repetition_beta,
-                         max_d_length, d_model=args.hidden_size, n_head=4, num_encoder_layers=1).to(args.device)
 
     if args.mode == 'train':
-        best = train_single_phase(model, train_loader, valid_loader, test_loader, args, logger, kg_data, train_am, train_pm)
+        best = train_single_phase(model, train_loader, valid_loader, test_loader, args, logger)
 
-        # test(model, os.path.join(args.save_path, "model_{}.xhr".format(best)), test_loader, args, logger, n_region, train_am, train_pm)
-        print("################## current exp done ##################")
     elif args.mode == 'test':
-        test(model, os.path.join(args.save_path, "model_best.xhr"), test_loader, args, logger, n_region, train_am, train_pm)
+        test(model, os.path.join(args.save_path, "model_best.xhr"), test_loader, args, logger, n_region)
 
     logger.close_log()
     

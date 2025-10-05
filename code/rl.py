@@ -47,13 +47,11 @@ except ImportError:
     SWANLAB_AVAILABLE = False
     logging.warning("SwanLab not available. Install with: pip install swanlab")
 
-# 导入prompt模块
-from prompt import TravelTrajectory, TravelPromptFormatter
 
 # ===== 为F1奖励加载SPOT-Trip模型与数据所需依赖 =====
 from data import TravelDataset, random_split  # 数据集
 from utils import collate_fn  # DataLoader的聚合函数
-from model import SPOTModel  # 主模型
+from model import SemPOIModel  # 主模型
 
 # 设置日志
 logging.basicConfig(level=logging.INFO)
@@ -285,7 +283,7 @@ class F1RewardEvaluator:
         max_d_length = max(len(seq) for seq in self._data.dsts)
         max_o_length = max(len(seq) for seq in self._data.oris)
 
-        model = SPOTModel(
+        model = SemPOIModel(
             args_stub,
             poi_size=len(self._data.poi_idx) + 1,
             region_poi=self._data.region_poi,
@@ -1289,7 +1287,6 @@ class TravelStyleGRPOTrainer:
 
 
 def main():
-    """主函数 - 演示使用方法"""
     import wandb
     import argparse
     wandb.init(mode="disabled")  # 强制禁用 wandb
@@ -1312,7 +1309,6 @@ def main():
     args.sft_output = args.sft_output + f"_{dataset_name}_sftepoch1"
     args.sft_project = args.sft_project + f"_{dataset_name}_sftepoch1"
     args.sft_run_name = args.sft_run_name + f"_{dataset_name}_sftepoch1"
-    # 初始化训练器（使用LoRA和accelerate）
 
     from datasets import load_from_disk
     if dataset_name == "Foursquare":
@@ -1334,7 +1330,7 @@ def main():
         lora_r=16,
         lora_alpha=32,
         is_sft=args.sft,
-        use_accelerate=args.use_accelerate,  # 启用accelerate支持
+        use_accelerate=args.use_accelerate,
         need_similarity_model=False
     )
 
@@ -1351,19 +1347,9 @@ def main():
             enable_swanlab=not args.no_swanlab,
             swanlab_project=args.sft_project,
         )
-        # 打印 SwanLab 查看命令
-        if not args.no_swanlab and SWANLAB_AVAILABLE:
-            print("\n=== SwanLab 查看方式 ===")
-            print("1) 启动本地面板: swanlab board")
-            print(f"2) 进入项目: {args.sft_project}")
-            print(f"3) 过滤 experiment_name == {args.sft_run_name}")
-            print("4) 关键指标前缀: sft/* \n")
-            print(f"LoRA 适配器路径: {adapter_dir}")
-        else:
-            print("SwanLab 未启用或不可用，跳过日志查看说明。")
-    else:
-        # 默认 GRPO 训练流程
 
+    else:
+        # RL for training
         trainer.train(
             text_dataset=text_dataset,
             output_dir=output_dir,
@@ -1377,11 +1363,6 @@ def main():
             is_gspo=False
         )
 
-    # 评估模型
-    # results = trainer.evaluate(test_trajectories)
-    # print(f"Evaluation results: {results}")
-
-    # 结束SwanLab实验记录
     if SWANLAB_AVAILABLE:
         swanlab.finish()
         print("SwanLab experiment finished")

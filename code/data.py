@@ -356,31 +356,31 @@ def random_split(dataset, dataset_name, split_path, ratios=[0.8, 0.1, 0.1]):
     with open(f'../{dataset_name}/data_split.pkl', 'wb') as file:
         pickle.dump([train_indice, valid_indice, test_indice], file)
 
-    return Subset(dataset, train_indice), Subset(dataset, valid_indice), Subset(dataset, test_indice) # train_indices 是训练数据的索引列表
+    return Subset(dataset, train_indice), Subset(dataset, valid_indice), Subset(dataset, test_indice)  # train_indices holds the indices for the training split
 
 class TravelTextDataset(Dataset):
     """
-    用于生成旅游轨迹文本描述的数据集类
-    生成用于GRPO训练的prompt和reference对
+    Dataset class that produces textual descriptions of travel trajectories.
+    Generates prompt and reference pairs for GRPO training.
     """
     def __init__(self, args, home_data_path, oot_data_path, travel_data_path):
         """
-        初始化文本数据集
-        
+        Initialize the text dataset.
+
         Args:
-            args: 配置参数
-            home_data_path: 原始地数据路径
-            oot_data_path: 目的地数据路径 
-            travel_data_path: 旅行数据路径
+            args: Configuration arguments.
+            home_data_path: Path to the hometown data file.
+            oot_data_path: Path to the destination data file.
+            travel_data_path: Path to the travel metadata file.
         """
         self.args = args
         
-        # 读取数据文件
+        # Load raw data files
         home_raw = list(map(lambda x: x.strip().split('\t'), open(home_data_path, 'r')))
         oot_raw = list(map(lambda x: x.strip().split('\t'), open(oot_data_path, 'r')))
         travel_raw = list(map(lambda x: x.strip().split('\t'), open(travel_data_path, 'r')))
         
-        # 加载pickle文件
+        # Load supporting pickle files
         with open(f"../{self.args.dataset_name}/poi_coord.pkl", "rb") as f:
             self.poi_coord = pickle.load(f)
         
@@ -390,16 +390,16 @@ class TravelTextDataset(Dataset):
         with open(f"../{self.args.dataset_name}/poi_id.pkl", "rb") as f:
             self.poi_idx = pickle.load(f)
         
-        # 按用户ID组织数据
+        # Organize data by user ID
         self.home_data = self._organize_data_by_user(home_raw)
         self.oot_data = self._organize_data_by_user(oot_raw)
         self.travel_data = {int(row[0]): (row[2], row[3]) for row in travel_raw}
         
-        # 生成文本对
+        # Generate prompt-reference pairs
         self.text_pairs = self._generate_text_pairs()
     
     def _organize_data_by_user(self, raw_data):
-        """按用户ID组织数据"""
+        """Organize raw trajectory rows by user ID."""
         user_data = defaultdict(list)
         for row in raw_data:
             uid, cuid, rid, bid, timestamp, std_tag = row
@@ -414,41 +414,41 @@ class TravelTextDataset(Dataset):
     
     def _format_trajectory_text(self, trajectory_data, region_name, query_type="hometown"):
         """
-        格式化轨迹数据为文本描述
-        
+        Format a trajectory into a textual description.
+
         Args:
-            trajectory_data: 轨迹数据列表
-            region_name: 区域名称
-            query_type: 查询类型 ("hometown" 或 "destination")
-        
+            trajectory_data: List of trajectory entries.
+            region_name: Name of the region associated with the trajectory.
+            query_type: Query mode ("hometown" or "destination").
+
         Returns:
-            格式化的文本描述
+            A formatted text description of the trajectory.
         """
         if not trajectory_data:
             return ""
         
-        # 按时间排序
+        # Sort by timestamp
         trajectory_data = sorted(trajectory_data, key=lambda x: x['timestamp'])
         
         poi_descriptions = []
-        # 获取时区字符串
+        # Retrieve the timezone string
         tz_str = self.city_tz_mapping.get(region_name, "UTC")
         try:
             local_tz = pytz.timezone(tz_str)
         except Exception:
             local_tz = timezone.utc
         for i, point in enumerate(trajectory_data):
-            # 限制最多50个POI
+            # Limit to at most 50 POIs
             if i >= 50:
                 break
             poi_id = point['poi_id']
             category = point['category']
             timestamp = point['timestamp']
-            # 获取POI坐标
+            # Look up the POI coordinates
             poi_num_id = self.poi_idx.get(poi_id, None)
             coord = self.poi_coord.get(poi_num_id, (0.0, 0.0))
             lat, lon = coord
-            # 转换时间戳为本地时间
+            # Convert the timestamp to local time
             dt_utc = datetime.fromtimestamp(timestamp, tz=timezone.utc)
             dt_local = dt_utc.astimezone(local_tz)
             local_time_str = dt_local.strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -474,7 +474,7 @@ Travel style description:"""
         return prompt
     
     def _generate_text_pairs(self):
-        """生成prompt和reference文本对"""
+        """Generate paired hometown prompts and destination references."""
         text_pairs = []
         
         for uid in self.travel_data:
@@ -485,12 +485,12 @@ Travel style description:"""
             home_trajectory = self.home_data[uid]
             oot_trajectory = self.oot_data[uid]
             
-            # 生成hometown prompt (用于训练时的输入)
+            # Build the hometown prompt (model input during training)
             hometown_prompt = self._format_trajectory_text(
                 home_trajectory, ori_region, "hometown"
             )
             
-            # 生成destination reference (用于训练时的参考答案)
+            # Build the destination reference (training target)
             destination_prompt = self._format_trajectory_text(
                 oot_trajectory, dst_region, "destination"
             )
@@ -508,50 +508,50 @@ Travel style description:"""
     
     def get_prompt_reference_pairs(self):
         """
-        获取用于GRPO训练的prompt和reference对
-        
+        Retrieve prompt and reference pairs for GRPO training.
+
         Returns:
-            tuple: (prompts列表, references列表)
+            tuple: (list of prompts, list of references)
         """
         prompts = []
         references = []
         
         for pair in self.text_pairs:
             prompts.append(pair['hometown_prompt'])
-            # 这里我们需要一个LLM来处理destination_prompt并生成reference
-            # 暂时使用destination_prompt作为占位符
+            # The destination prompt can be treated as a placeholder reference
+            # until an LLM-generated description is available.
             references.append(pair['destination_prompt'])
         
         return prompts, references
     
     def __len__(self):
-        """返回文本对的数量"""
+        """Return the number of prompt-reference pairs."""
         return len(self.text_pairs)
     
     def __getitem__(self, index):
-        """获取指定索引的文本对"""
+        """Return the prompt-reference pair at the specified index."""
         return self.text_pairs[index]
 
     def get_data(self, trajectory_data, region_name, query_type="hometown"):
         """
-        格式化轨迹数据为文本描述
+        Format trajectory data into structured components.
 
         Args:
-            trajectory_data: 轨迹数据列表
-            region_name: 区域名称
-            query_type: 查询类型 ("hometown" 或 "destination")
+            trajectory_data: List of trajectory entries.
+            region_name: Associated region name.
+            query_type: Query mode ("hometown" or "destination").
 
         Returns:
-            格式化的文本描述
+            Tuple of POI IDs, categories, and timestamp strings.
         """
         if not trajectory_data:
             return ""
 
-        # 按时间排序
+        # Sort by timestamp
         trajectory_data = sorted(trajectory_data, key=lambda x: x['timestamp'])
 
         poi_descriptions = []
-        # 获取时区字符串
+        # Retrieve timezone information
         tz_str = self.city_tz_mapping.get(region_name, "UTC")
         try:
             local_tz = pytz.timezone(tz_str)
@@ -566,11 +566,11 @@ Travel style description:"""
             poi_id = point['poi_id']
             category = point['category']
             timestamp = point['timestamp']
-            # 获取POI坐标
+            # Look up the POI coordinates
             poi_num_id = self.poi_idx.get(poi_id, None)
             coord = self.poi_coord.get(poi_num_id, (0.0, 0.0))
             lat, lon = coord
-            # 转换时间戳为本地时间
+            # Convert the timestamp to local time
             dt_utc = datetime.fromtimestamp(timestamp, tz=timezone.utc)
             dt_local = dt_utc.astimezone(local_tz)
             local_time_str = dt_local.strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -582,7 +582,7 @@ Travel style description:"""
         return poi_ids, categories, timestamps
 
     def generate_json(self):
-        """生成json数据对"""
+        """Generate JSON-ready trajectory data pairs."""
         text_pairs = []
 
         for uid in self.travel_data:
@@ -593,12 +593,12 @@ Travel style description:"""
             home_trajectory = self.home_data[uid]
             oot_trajectory = self.oot_data[uid]
 
-            # 生成hometown prompt (用于训练时的输入)
+            # Build hometown prompt components (model input)
             hometown_poi_ids, hometown_categories, hometown_timestamps = self.get_data(
                 home_trajectory, ori_region, "hometown"
             )
 
-            # 生成destination reference (用于训练时的参考答案)
+            # Build destination reference components (training target)
             destination_poi_ids, destination_categories, destination_timestamps = self.get_data(
                 oot_trajectory, dst_region, "destination"
             )
@@ -621,14 +621,14 @@ Travel style description:"""
 
 def create_travel_text_dataset(args, dataset_name):
     """
-    创建旅游文本数据集的便捷函数
-    
+    Convenience function for building a TravelTextDataset instance.
+
     Args:
-        args: 配置参数
-        dataset_name: 数据集名称
-    
+        args: Configuration arguments.
+        dataset_name: Dataset identifier.
+
     Returns:
-        TravelTextDataset实例
+        TravelTextDataset instance.
     """
     home_path = f"../{dataset_name}/home.txt"
     oot_path = f"../{dataset_name}/oot.txt"
@@ -639,28 +639,29 @@ def create_travel_text_dataset(args, dataset_name):
 
 def extract_and_save_poi_metadata(dataset_name):
     """\
-    提取每个数字 POI id 对应的元信息 (原始字符串 bid, 纬度, 经度, 所在城市 / 区域, 类别) 并保存。
+    Extract and persist metadata for each numeric POI identifier
+    (original string bid, latitude, longitude, associated regions, categories).
 
-    数据来源:
-      - ../{dataset_name}/home.txt  与  ../{dataset_name}/oot.txt
-        行格式: uid\tcuid\trid\tbid\ttimestamp\tstd_tag
-      - ../{dataset_name}/poi_id.pkl : 原始 bid -> 数字 POI id 的映射
-      - ../{dataset_name}/poi_coord.pkl : 数字 POI id -> (lat, lon)
+    Source files:
+        - ../{dataset_name}/home.txt and ../{dataset_name}/oot.txt
+          Row format: uid\tcuid\trid\tbid\ttimestamp\tstd_tag
+        - ../{dataset_name}/poi_id.pkl : mapping from original bid to numeric POI id
+        - ../{dataset_name}/poi_coord.pkl : mapping from numeric POI id to (lat, lon)
 
-    产出文件:
-      - ../{dataset_name}/poi_meta.pkl  (dict)
-      - ../{dataset_name}/poi_meta.json (UTF-8 JSON, 便于查看)
+    Outputs:
+        - ../{dataset_name}/poi_meta.pkl  (dictionary serialized with pickle)
+        - ../{dataset_name}/poi_meta.json (UTF-8 JSON for human inspection)
 
-    每个 POI 的结构示例:
-      poi_meta[num_id] = {
-          'bid': 'original_string_id',
-          'lat': 31.2345,
-          'lon': 121.4567,
-          'regions': ['shanghai'],            # 出现过的所有区域 (去重)
-          'categories': ['Food', 'Coffee'],    # 出现过的所有类别 (去重)
-          'main_region': 'shanghai',          # 最频繁区域
-          'main_category': 'Food'             # 最频繁类别
-      }
+    Example structure for each POI:
+        poi_meta[num_id] = {
+            'bid': 'original_string_id',
+            'lat': 31.2345,
+            'lon': 121.4567,
+            'regions': ['shanghai'],            # All unique regions encountered
+            'categories': ['Food', 'Coffee'],    # All unique categories encountered
+            'main_region': 'shanghai',          # Region with highest frequency
+            'main_category': 'Food'             # Most frequent category
+        }
     """
     import pickle, json, os
     from collections import defaultdict, Counter
@@ -671,17 +672,17 @@ def extract_and_save_poi_metadata(dataset_name):
     poi_id_path = os.path.join(base_dir, 'poi_id.pkl')
     poi_coord_path = os.path.join(base_dir, 'poi_coord.pkl')
 
-    # 读取必要的映射文件
+    # Read required mapping files
     if not (os.path.exists(poi_id_path) and os.path.exists(poi_coord_path)):
-        raise FileNotFoundError("需要先生成 poi_id.pkl 与 poi_coord.pkl")
+        raise FileNotFoundError("Please generate poi_id.pkl and poi_coord.pkl first.")
     with open(poi_id_path, 'rb') as f:
-        bid2num = pickle.load(f)  # 原始 bid -> 数字 id
-    # 反向映射: 数字 id -> 原始 bid
+        bid2num = pickle.load(f)  # Original bid -> numeric id
+    # Inverse mapping: numeric id -> original bid
     num2bid = {v: k for k, v in bid2num.items()}
     with open(poi_coord_path, 'rb') as f:
-        numid2coord = pickle.load(f)  # 数字 id -> (lat, lon)
+        numid2coord = pickle.load(f)  # Numeric id -> (lat, lon)
 
-    # 读取轨迹文本 (home + oot)
+    # Read trajectory text (home + oot)
     def _read_lines(p):
         if not os.path.exists(p):
             return []
@@ -690,7 +691,7 @@ def extract_and_save_poi_metadata(dataset_name):
 
     all_rows = _read_lines(home_path) + _read_lines(oot_path)
 
-    # 汇总 region / category
+    # Aggregate region/category statistics
     region_counter = defaultdict(Counter)   # num_id -> Counter(region)
     category_counter = defaultdict(Counter) # num_id -> Counter(category)
 
@@ -721,12 +722,12 @@ def extract_and_save_poi_metadata(dataset_name):
             'main_category': main_category
         }
 
-    # 保存
+    # Persist metadata to disk
     meta_pkl = os.path.join(base_dir, 'poi_meta.pkl')
     meta_json = os.path.join(base_dir, 'poi_meta.json')
     with open(meta_pkl, 'wb') as f:
         pickle.dump(poi_meta, f)
-    # JSON 需要可序列化 key -> 转成字符串 key
+    # Convert keys to strings for JSON serialization
     json_serializable = {int(k): v for k, v in poi_meta.items()}
     with open(meta_json, 'w', encoding='utf-8') as f:
         json.dump(json_serializable, f, ensure_ascii=False, indent=2)
@@ -735,7 +736,7 @@ def extract_and_save_poi_metadata(dataset_name):
 
 
 if __name__ == '__main__':
-    # args = type('', (), {})()  # 创建一个空对象作为args
+    # args = type('', (), {})()  # Create an empty object to mimic args
     # args.dataset_name = 'Yelp'
 
     # travel_dataset = TravelTextDataset(args, f'../{args.dataset_name}/home.txt', f'../{args.dataset_name}/oot.txt', f'../{args.dataset_name}/travel.txt')
@@ -744,4 +745,4 @@ if __name__ == '__main__':
     #     json.dump(text_pairs, f)
     dataset_name = 'Yelp'
     poi_meta = extract_and_save_poi_metadata(dataset_name)
-    print(f"提取并保存了 {len(poi_meta)} 个 POI 的元信息")
+    print(f"Extracted and saved metadata for {len(poi_meta)} POIs")

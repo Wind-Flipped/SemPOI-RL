@@ -4,21 +4,11 @@ from ast import parse
 # os.environ["CUDA_VISIBLE_DEVICES"] = "1, 2"  # Set the visible GPU device
 import os
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3'  # 设置可见GPU设备
+os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3'  
 import torch
-import torch.nn as nn
-from torch.nn.utils.rnn import pad_sequence
-from torch.optim import Adam
-from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader
-import torch.nn.functional as F
 
 import argparse
-from collections import namedtuple, defaultdict
-import numpy as np
-import os
-import sys
-from copy import copy
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -27,11 +17,8 @@ try:
 except:
     pass
 
-from utils import *
-from data import TravelDataset, random_split, KGDataset
-from ARmodel import ARModel
-from model import SPOTModel
-import metrics
+from data import TravelDataset, random_split
+from model import SemPOIModel
 from trainer import *
 
 import pickle
@@ -52,7 +39,6 @@ def main():
     parser.add_argument('--data_split_path', type=str, default=f'../{dataset_name}/data_split.pkl')
 
     # Training Configurations
-    parser.add_argument('--model', type=str, default='SPOT-Trip')
     parser.add_argument('--mode', type=str, default='train')
     parser.add_argument('--train_batch', type=int, default=4)
     parser.add_argument('--save_step', type=int, default=1)
@@ -75,33 +61,6 @@ def main():
     parser.add_argument("--stop_epoch", type=int, default=2)  # early stopping
     parser.add_argument("--fine_stop", type=int, default=12)
 
-    # Knowledge Graph (KG) Arguments
-    parser.add_argument("--segments", type=int, default=16)
-    parser.add_argument("--kg", action="store_true")
-    parser.add_argument("--entity_num_per_poi", type=int, default=2)  # Note: F 2 For Yelp, use 10
-    parser.add_argument("--train_trans", action="store_true")
-    parser.add_argument('--trans', type=str, default="transe")
-    parser.add_argument("--contrast", action="store_true")
-    parser.add_argument("--kgcn", type=str, default="RGAT")
-    parser.add_argument("--kg_p_drop", type=float, default=0.5)
-    parser.add_argument("--ui_p_drop", type=float, default=0.1)
-    parser.add_argument("--tau", type=float, default=0.2)
-
-    # AR-Trip
-    parser.add_argument("--drifting", action="store_true")
-    parser.add_argument("--guiding", action="store_true")
-    parser.add_argument("--repetition_beta", type=float, default=1.0)
-    parser.add_argument("--train_type", type=str, default='Penalty')
-    parser.add_argument('--confidence', type=float, default=0.5)
-    # ODE
-    parser.add_argument("--ode", action="store_true")
-    parser.add_argument("--t_unif_res", type=int, default=10,
-                        help="Number of point in unfirom temporal grid used for intepolation.")
-    parser.add_argument("--solver", type=str, default="dopri5", help="Name of the ODE solver (see torchdiffeq).")
-    parser.add_argument("--rtol", type=float, default=1e-5, help="Relative tolerance for ODE solver.")
-    parser.add_argument("--atol", type=float, default=1e-5, help="Absolute tolerance for ODE solver.")
-    parser.add_argument("--dyn_hid_layers", type=int, default=3, help="Number of hidden layers in dynamics function.")
-    parser.add_argument("--dyn_latent_dim", type=int, default=128, help="Hidden layer dimension in dynamics function.")
     # Model (lm).
     parser.add_argument("--lm_hid_layers", type=int, default=3, help="Number of hidden layers in intensity function.")
     parser.add_argument("--lm_latent_dim", type=int, default=128, help="Hidden layer dimension in intensity function.")
@@ -141,30 +100,30 @@ def main():
     args.save_path = f'../{args.dataset_name}/model_save'
     if args.dataset_name == 'Foursquare':
         args.dataset_path = '../dataset/travel_dataset_20250712_201017'
-        # 强化学习后的路径
+        # Path after reinforcement learning
         # args.lora_path = "./sft_grpo_Foursquare_f1_cat_0.75_0.1_8_lora_model/checkpoint-1503"
-        # 强化学习1轮后的路径
+        # Path after one round of reinforcement learning
         # args.lora_path = "./sft_grpo_Foursquare_f1_epoch1/checkpoint-1503"
-        # 只有SFT的路径
+        # Path for SFT only
         # args.lora_path = "./sft_travel_style_lora/checkpoint-752"
-        # 只有SFT1轮的路径
+        # Path for a single SFT epoch
         args.lora_path = "./sft_travel_style_lora_Foursquare_sftepoch1/checkpoint-376"
-        # 使用Refine-POI的reward
+        # Path using the Refine-POI reward
         # args.lora_path = "./sft_grpo_Foursquare_f1_RefinePOI"
         args.lora_path2 = "./sft_grpo_Foursquare_f1_RefinePOI_newlora"
     elif args.dataset_name == 'Yelp':
         args.dataset_path = '../dataset/Yelp_20250714_192438'
-        # 强化学习2轮后的路径
+        # Path after two rounds of reinforcement learning
         # args.lora_path = "./sft_grpo_Yelp_f1_cat_0.75_0.1_8_lora_model/checkpoint-2208"
-        # 强化学习1轮后的路径
+        # Path after one round of reinforcement learning
         # args.lora_path = "./sft_grpo_Yelp_f1_epoch1/checkpoint-2208"
-        # 只有SFT的路径
+        # Path for SFT only
         # args.lora_path = "./sft_travel_style_lora_Yelp/checkpoint-4418"
-        # 只有SFT1轮的路径
+        # Path for a single SFT epoch
         # args.lora_path = "./sft_travel_style_lora_Yelp_sftepoch1/checkpoint-553"
-        # 使用了真实的f1-score
+        # Path using the real F1-score
         args.lora_path = "./sft_grpo_Yelp_f1_epoch1_withRealf1"
-        # 使用Refine-POI的reward
+        # Path using the Refine-POI reward
         # args.lora_path = "./sft_grpo_Yelp_f1_epoch1_RefinePOI"
         args.lora_path2 = "./sft_grpo_Yelp_f1_epoch1_RefinePOI_newlora"
     set_seeds(args.seed)
@@ -187,10 +146,6 @@ def main():
     data = TravelDataset(args, args.ori_data, args.dst_data, args.trans_data)
 
     # Checking if the knowledge graph (KG) option is enabled and loading KG data accordingly
-    if args.kg:
-        kg_data = KGDataset(args)
-    else:
-        kg_data = None
     train_data, valid_data, test_data = random_split(data, dataset_name=dataset_name, split_path=args.data_split_path)
 
     # train_loader = DataLoader(train_data, args.train_batch, shuffle=True, collate_fn=collate_fn)
@@ -202,9 +157,8 @@ def main():
     max_o_length = max(len(seq) for seq in data.oris)
 
 
-    model = SPOTModel(args, len(data.poi_idx) + 1, data.region_poi, max_d_length, max_o_length,
-                          d_model=args.hidden_size, n_head=4, num_encoder_layers=1, d_z=args.hidden_size,
-                          kg_dataset=kg_data)
+    model = SemPOIModel(args, len(data.poi_idx) + 1, data.region_poi, max_d_length, max_o_length,
+                          d_model=args.hidden_size, n_head=4, num_encoder_layers=1, d_z=args.hidden_size)
     if args.dataset_name == "Yelp" and args.eval_dataset == "test":
         test(model, os.path.join(args.save_path, "model_5.xhr"), test_loader, args, logger, n_region)
     elif args.dataset_name == "Foursquare" and args.eval_dataset == "test":
