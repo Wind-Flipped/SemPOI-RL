@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-from ast import parse
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3'
 from torch.utils.data import DataLoader
@@ -12,13 +11,10 @@ try:
 except:
     pass
 
-from utils import *
 from data import TravelDataset, random_split
 from model import SemPOIModel
-import metrics
 from trainer import *
 
-import pickle
 
 def main():
     parser = argparse.ArgumentParser()
@@ -38,9 +34,9 @@ def main():
     parser.add_argument('--mode', type=str, default='train')
     parser.add_argument('--train_batch', type=int, default=4)
     parser.add_argument('--save_step', type=int, default=1)
-    parser.add_argument('--test_batch', type=int, default=1)
+    parser.add_argument('--test_batch', type=int, default=4)
     parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--hidden_size', type=int, default=128)
+    parser.add_argument('--hidden_size', type=int, default=256)
     parser.add_argument("--projection_dim", type=int, default=64)
 
     parser.add_argument('--margin', type=int, default=1)
@@ -64,12 +60,12 @@ def main():
     parser.add_argument("--lora_path", type=str, default="./grpo_travel_style_lora_model/checkpoint-5500", help="Path to the LoRA model")
     parser.add_argument("--lora_path2", type=str, default=None, help="Path to the second LoRA model. Used for reinforcement learning")
     parser.add_argument("--dataset_path", type=str, default="../dataset/Yelp_20250714_192438", help="Path to the dataset for LLM training")
-    parser.add_argument("--st_module", action="store_true", help="use SpatialTemporal module")
+    parser.add_argument("--st_module", action="store_true", help="Use SpatialTemporal module")
     # Semantic Masking parameters
-    parser.add_argument("--num_semantic_parts", type=int, default=0, help="Number of semantic parts for semantic-aware masking in MAE. Set to 0 to disable semantic masking and use random masking only.")
+    parser.add_argument("--num_semantic_parts", type=int, default=8, help="Number of semantic parts for semantic-aware masking in MAE. Set to 0 to disable semantic masking and use random masking only.")
     parser.add_argument("--lambda_diversity", type=float, default=0.1, help="Weight for diversity loss in MAE.")
     parser.add_argument("--lambda_attn_reg", type=float, default=0.1, help="Weight for attention regulation loss in MAE.")
-    parser.add_argument("--mask_ratio", type=float, default=0.5, help="Mask ratio for MAE.")
+    parser.add_argument("--mask_ratio", type=float, default=0.75, help="Mask ratio for MAE.")
 
     args = parser.parse_args()
     args.ori_data = f'../{args.dataset_name}/home.txt'
