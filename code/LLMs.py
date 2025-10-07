@@ -319,7 +319,6 @@ class TravelStyleRewardCalculator:
             fallback_dim = embedding_dim if embedding_dim is not None else 768  # Default dimension
             return np.zeros((len(texts), fallback_dim))
 
-# Standalone reward helpers (aligned with test.py format)
 def travel_style_similarity_reward_func(similarity_model, prompts, completions, reference_responses, **kwargs) -> list[float]:
     """
     Reward function based on travel-style similarity.

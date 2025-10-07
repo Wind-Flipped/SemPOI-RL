@@ -1,0 +1,17 @@
+[
+  {
+    "index": 0,
+    "prompt": "As a professional travel analyst and user profiling expert, analyze the user's POI (Point of Interest) trajectory data from their hometown to predict their potential travel style at their destination....",
+    "reference": "The user's travel style in Tucson indicates a blend of comfort, casual dining, and light recreational activities. Their trajectory begins with a hotel stay, suggesting a focus on accommodation and con..."
+  },
+  {
+    "index": 1,
+    "prompt": "As a professional travel analyst and user profiling expert, analyze the user's POI (Point of Interest) trajectory data from their hometown to predict their potential travel style at their destination....",
+    "reference": "\n\n\nThe user's travel style in New Orleans suggests a blend of cultural and social engagement with a focus on local cuisine and entertainment. Their trajectory includes multiple visits to Southern and ..."
+  },
+  {
+    "index": 2,
+    "prompt": "As a professional travel analyst and user profiling expert, analyze the user's POI (Point of Interest) trajectory data from their hometown to predict their potential travel style at their destination....",
+    "reference": "</think>\n\nThe user's travel style in Nashville suggests a focus on social and leisure activities with a blend of nightlife and fashion. The sequence begins with a visit to a beer establishment, indica..."
+  }
+]

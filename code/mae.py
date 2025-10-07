@@ -17,27 +17,27 @@ class MaskedAutoEncoder(nn.Module):
 
         self.seq_len = seq_len
         self.embed_dim = embed_dim
-        self.num_semantic_parts = num_semantic_parts  # 语义部分数量
-        self.lambda_diversity = lambda_diversity  # 语义多样性损失权重
-        # 注意力正则（熵正则 + 可选最大权重惩罚）
+        self.num_semantic_parts = num_semantic_parts  # Number of semantic segments
+        self.lambda_diversity = lambda_diversity  # Weight for semantic diversity loss
+        # Attention regularization (entropy regularization + optional max-weight penalty)
         self.lambda_attn_reg = lambda_attn_reg
         self.lambda_attn_max = 0.0
-        # 训练阶段缓存注意力用于正则
+        # Cache attention weights during training for regularization
         self._last_attention_weights = None
         self._last_attention_valid_mask = None
 
         # --------------------------------------------------------------------------
         # MAE encoder specifics
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        # 用于在Encoder侧重建完整序列时填充被mask的位置（仅用于语义打印，不参与反向传播）
+        # Token used to rebuild the full sequence on the encoder side for inspection only
         self.encoder_mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.external_cls_token = None  # 用于存储外部LLM embedding作为cls_token
-        self.semantic_parts_embedding = None  # 用于存储语义部分信息
+        self.external_cls_token = None  # Stores external LLM embeddings as the cls token
+        self.semantic_parts_embedding = None  # Stores semantic component representations
         self.pos_embed = nn.Parameter(
             torch.zeros(1, seq_len + 1, embed_dim), requires_grad=False
         )  # fixed sin-cos embedding, +1 for cls token
 
-        # 语义编码网络：用于生成 num_semantic_parts 个语义表征
+        # Semantic encoding network for generating num_semantic_parts representations
         # F_p = F_c ◦ sigmoid(W_{c2} tanh(W_{c1} F_c))
         if num_semantic_parts > 0:
             self.semantic_W_c1_list = nn.ModuleList([
@@ -46,12 +46,12 @@ class MaskedAutoEncoder(nn.Module):
             self.semantic_W_c2_list = nn.ModuleList([
                 nn.Linear(embed_dim, embed_dim) for _ in range(num_semantic_parts)
             ])
-            # 用于将语义表征与encoder输出结合的线性层
+            # Linear layer that fuses semantic representations with encoder outputs
             self.semantic_fusion_layer = nn.Linear(embed_dim * 2, embed_dim)
-            # 用于生成注意力权重的线性层
+            # Linear layer that produces attention weights
             self.semantic_attention_layer = nn.Linear(embed_dim, 1)
 
-            # Cross-Attention 投影层（Q 来自 encoder_output，K/V 来自 semantic_parts_embedding）
+            # Cross-attention projection layers (Q from encoder_output, K/V from semantic_parts_embedding)
             self.semantic_q = nn.Linear(embed_dim, embed_dim, bias=True)
             self.semantic_k = nn.Linear(embed_dim, embed_dim, bias=True)
             self.semantic_v = nn.Linear(embed_dim, embed_dim, bias=True)
@@ -82,7 +82,7 @@ class MaskedAutoEncoder(nn.Module):
         )  # fixed sin-cos embedding, +1 for cls token
 
         self.decoder_blocks = nn.ModuleList([
-            nn.TransformerEncoderLayer(  # 使用Encoder作为Decoder
+            nn.TransformerEncoderLayer(  # Reuse encoder blocks as the decoder
                 d_model=decoder_embed_dim,
                 nhead=decoder_num_heads,
                 dim_feedforward=int(decoder_embed_dim * mlp_ratio),
@@ -103,19 +103,19 @@ class MaskedAutoEncoder(nn.Module):
     
     def set_external_cls_token(self, P_L):
         """
-        设置外部 LLM embedding 作为 cls_token 并生成语义部分信息
+        Assign an external LLM embedding as the cls token and generate semantic components.
         Args:
-            P_L: [N, D] LLM embedding，如果 D > embed_dim 则截断，如果 D < embed_dim 则填充
-        
-        Note: 当 num_semantic_parts = 0 时，只设置 cls_token 但不生成语义部分信息，
-              此时将使用普通的随机masking策略
+            P_L: [N, D] LLM embedding. Truncate if D > embed_dim, pad with zeros if D < embed_dim.
+
+        Note: When num_semantic_parts = 0, only the cls token is set and no semantic components are produced;
+              the model falls back to standard random masking in that case.
         """
         if P_L is not None:
-            # 处理维度不匹配问题
+            # Handle potential dimensionality mismatches
             if P_L.shape[-1] > self.embed_dim:
-                P_L_processed = P_L[:, :self.embed_dim]  # 截断
+                P_L_processed = P_L[:, :self.embed_dim]  # Truncate
             elif P_L.shape[-1] < self.embed_dim:
-                # 填充零
+                # Zero-pad shorter embeddings
                 padding = torch.zeros(P_L.shape[0], self.embed_dim - P_L.shape[-1], device=P_L.device, dtype=P_L.dtype)
                 P_L_processed = torch.cat([P_L, padding], dim=-1)
             else:
@@ -123,7 +123,7 @@ class MaskedAutoEncoder(nn.Module):
             
             self.external_cls_token = P_L_processed.unsqueeze(1)  # [N, 1, embed_dim]
             
-            # 根据LLM embedding生成语义部分信息
+            # Derive semantic component representations from the LLM embedding
             self._generate_semantic_parts(P_L_processed)
         else:
             self.external_cls_token = None
@@ -131,12 +131,12 @@ class MaskedAutoEncoder(nn.Module):
     
     def _generate_semantic_parts(self, P_L):
         """
-        根据LLM embedding生成语义部分信息
-        使用新的语义编码方法：F_p = F_c ◦ sigmoid(W_{c2} tanh(W_{c1} F_c))
+        Generate semantic component representations from the LLM embedding using
+        F_p = F_c ◦ sigmoid(W_{c2} tanh(W_{c1} F_c)).
         Args:
-            P_L: [N, embed_dim] 处理后的LLM embedding (F_c)
+            P_L: [N, embed_dim] processed LLM embedding (F_c)
         """
-        # 如果num_semantic_parts为0，则不生成语义部分信息
+        # Skip semantic component construction if num_semantic_parts is zero
         if self.num_semantic_parts == 0:
             self.semantic_parts_embedding = None
             return
@@ -144,7 +144,7 @@ class MaskedAutoEncoder(nn.Module):
         batch_size = P_L.shape[0]
         device = P_L.device
         
-        # 生成 num_semantic_parts 个语义表征
+        # Generate num_semantic_parts semantic representations
         # F_p = F_c ◦ sigmoid(W_{c2} tanh(W_{c1} F_c))
         semantic_parts_list = []
         
@@ -158,21 +158,21 @@ class MaskedAutoEncoder(nn.Module):
             # sigmoid(W_{c2} tanh(W_{c1} F_c))
             gate = torch.sigmoid(h2)  # [N, embed_dim]
             # F_p = F_c ◦ sigmoid(W_{c2} tanh(W_{c1} F_c))
-            F_p = P_L * gate  # [N, embed_dim] 元素级别乘法
+            F_p = P_L * gate  # [N, embed_dim] element-wise multiplication
             
             semantic_parts_list.append(F_p)
         
-        # 将所有语义表征堆叠：[N, num_semantic_parts, embed_dim]
+        # Stack all semantic representations: [N, num_semantic_parts, embed_dim]
         self.semantic_parts_embedding = torch.stack(semantic_parts_list, dim=1)
     
     def apply_semantic_encoding(self, encoder_output, return_attention_weights=False):
         """
-        使用 Cross-Attention 将语义表征与 Encoder 输出结合。
-        - 语义部分 embedding（[N, P, D]）作为 Key/Value
-        - Encoder 输出（[N, L, D]）作为 Query
-        返回：
+        Fuse semantic representations with encoder outputs via cross-attention.
+        - Semantic part embeddings ([N, P, D]) act as keys and values.
+        - Encoder outputs ([N, L, D]) act as queries.
+        Returns:
             semantic_enhanced: [N, L, D]
-            attention_weights (可选): [N, P, L, 1]，在语义部分维度上的注意力分布
+            attention_weights (optional): [N, P, L, 1] attention distribution over semantic parts
         """
         if self.num_semantic_parts == 0 or self.semantic_parts_embedding is None:
             if return_attention_weights:
@@ -183,24 +183,24 @@ class MaskedAutoEncoder(nn.Module):
         N, L, D = encoder_output.shape
         P = self.num_semantic_parts
 
-        # 线性投影到 Q/K/V 空间
+        # Linear projections into the Q/K/V spaces
         # Q: [N, L, D], K: [N, P, D], V: [N, P, D]
         Q = self.semantic_q(encoder_output)
         K = self.semantic_k(self.semantic_parts_embedding)
         V = self.semantic_v(self.semantic_parts_embedding)
 
-        # 注意力分数：Q @ K^T / sqrt(D)
+        # Attention scores: Q @ K^T / sqrt(D)
         # QK^T: [N, L, P]
         scale = D ** 0.5
         attn_logits = torch.matmul(Q, K.transpose(1, 2)) / scale  # [N, L, P]
-        attn = torch.softmax(attn_logits, dim=-1)  # 在语义部分维度上 softmax
+        attn = torch.softmax(attn_logits, dim=-1)  # Softmax over the semantic dimension
 
-        # 上述注意力权重用于 introspection/正则：格式化为 [N, P, L, 1]
+        # Reformat attention weights for inspection/regularization: [N, P, L, 1]
         attn_for_return = attn.permute(0, 2, 1).unsqueeze(-1)  # [N, P, L, 1]
 
-        # 加权求和得到 cross-attended 表征: [N, L, D]
+        # Weighted sum yields the cross-attended representations: [N, L, D]
         semantic_context = torch.matmul(attn, V)  # [N, L, D]
-        semantic_enhanced = self.semantic_out(semantic_context) + encoder_output  # 残差连接
+        semantic_enhanced = self.semantic_out(semantic_context) + encoder_output  # Residual connection
 
         if return_attention_weights:
             return semantic_enhanced, attn_for_return
@@ -209,15 +209,15 @@ class MaskedAutoEncoder(nn.Module):
     
     def get_cls_token(self, batch_size, device):
         """
-        获取当前使用的 cls_token
+        Retrieve the cls token to use for the current batch.
         Returns:
-            [N, 1, embed_dim] 的 cls_token
+            [N, 1, embed_dim] cls token tensor
         """
         if self.external_cls_token is not None:
-            # 使用外部设置的 LLM embedding 作为 cls_token
+            # Use the externally provided LLM embedding as the cls token
             return self.external_cls_token + self.pos_embed[:, :1, :].to(device)
         else:
-            # 使用默认的可学习 cls_token
+            # Fall back to the default learnable cls token
             cls_token = self.cls_token + self.pos_embed[:, :1, :]
             return cls_token.expand(batch_size, -1, -1)
     
@@ -285,27 +285,27 @@ class MaskedAutoEncoder(nn.Module):
     def semantic_aware_masking(self, x, mask_ratio, mask_lambda=1.0, hometown_len_list=None, 
                               destination_start_list=None, destination_end_list=None, valid_mask=None):
         """
-        实现语义感知的混合masking策略
-        注意：这个方法现在仅用于向后兼容，新的语义编码方法不需要这种masking策略
+        Legacy semantic-aware masking strategy retained for backward compatibility.
+        Note: The new semantic encoding pipeline no longer relies on this masking scheme.
         """
         N, L, D = x.shape
         
         if valid_mask is None:
             valid_mask = torch.ones(N, L, dtype=torch.bool, device=x.device)
         
-        # 如果num_semantic_parts为0或没有语义部分信息，回退到原始masking策略
+        # Fall back to the original random masking when no semantic part information is available
         if self.num_semantic_parts == 0 or self.semantic_parts_embedding is None:
             return self.random_masking(x, mask_ratio, hometown_len_list, 
                                      destination_start_list, destination_end_list, valid_mask)
         
-        # 新的语义编码方法不需要特殊的masking，直接使用随机masking
+        # The current semantic encoding pipeline simply uses random masking
         return self.random_masking(x, mask_ratio, hometown_len_list, 
                                  destination_start_list, destination_end_list, valid_mask)
     
     def random_masking(self, x, mask_ratio, hometown_len_list=None, destination_start_list=None, destination_end_list=None, valid_mask=None):
         """
         Perform per-sample random masking by per-sample shuffling for destination sequences.
-        Training时：可以mask整个destination sequence（包括头部和尾部位置）
+        During training we may mask the entire destination sequence, including the first and last elements.
         x: [N, L, D], sequence (hometown + destination concatenated)
         hometown_len_list: list of int, length of hometown sequence for each sample
         destination_start_list: list of int, start position of destination sequence in concatenated sequence
@@ -493,14 +493,14 @@ class MaskedAutoEncoder(nn.Module):
         """
         Forward through encoder
         x: [N, L, D]
-        mask_lambda: 语义感知masking的混合权重参数（已弃用，新语义编码不使用特殊masking）
+        mask_lambda: blending factor for legacy semantic-aware masking (deprecated)
         hometown_len_list: list of int, length of hometown sequence for each sample
         destination_start_list: list of int, start position of destination sequence
         destination_end_list: list of int, end position of destination sequence
         valid_mask: [N, L], True for valid positions
-        use_semantic_masking: 语义感知masking开关（已弃用，新语义编码在decoder中处理）
-        
-        注意：新的语义编码方法在decoder阶段进行语义增强，encoder阶段使用标准的随机masking
+        use_semantic_masking: toggle for legacy semantic-aware masking (deprecated)
+
+        Note: Semantic enrichment now happens in the decoder; the encoder always applies random masking.
         """
         # Add pos embed (without cls token)
         if x.shape[1] <= self.pos_embed.shape[1] - 1:  # -1 for cls token
@@ -510,9 +510,9 @@ class MaskedAutoEncoder(nn.Module):
             pos_embed_extended = self.pos_embed[:, 1:, :].repeat(1, (x.shape[1] // (self.pos_embed.shape[1] - 1)) + 1, 1)
             x = x + pos_embed_extended[:, :x.shape[1], :]
         
-        # Masking - 新语义编码方法统一使用随机masking
+        # Masking step – the new semantic encoding pipeline always uses random masking
         if training:
-            # 使用随机masking策略（新语义编码在decoder中处理）
+            # Apply random masking; semantic processing now happens inside the decoder
             x_masked, mask, ids_keep_list, ids_restore_list, keep_mask = self.random_masking(
                 x, mask_ratio, hometown_len_list, destination_start_list, destination_end_list, valid_mask
             )
@@ -521,7 +521,7 @@ class MaskedAutoEncoder(nn.Module):
                 x, hometown_len_list, destination_start_list, destination_end_list, valid_mask
             )
         
-        # 获取 cls_token（可能是默认的或外部设置的LLM embedding）
+        # Fetch the appropriate cls token (either default or external LLM-based)
         cls_tokens = self.get_cls_token(x_masked.shape[0], x.device)
         
         x_masked = torch.cat((cls_tokens, x_masked), dim=1)
@@ -550,33 +550,33 @@ class MaskedAutoEncoder(nn.Module):
         """
         N = len(ids_keep_list)
         
-        # 如果启用了语义编码，应用语义增强
+        # Apply semantic enhancement when semantic encoding is enabled
         if self.num_semantic_parts > 0 and self.semantic_parts_embedding is not None:
-            # 移除cls token进行语义增强
+            # Remove the cls token before semantic enhancement
             x_no_cls = x_encoded[:, 1:, :]  # [N, L, embed_dim]
             
-            # 应用语义编码（在语义融合前加入位置编码，使不同位置有不同语义表征）
-            # 在推理时（非训练）先把mask的token添加回Encoder侧完整序列，再做语义嵌入并打印
+            # Apply semantic encoding; add position embeddings beforehand to keep location-specific semantics.
+            # During inference, rebuild the full encoder sequence before semantic fusion for inspection.
             if not training:
-                # 1) 基于Encoder输出重建完整长度的序列（被mask位置用encoder_mask_token填充）
+                # 1) Reconstruct the full-length encoder sequence (filling masked positions with encoder_mask_token)
                 D_enc = x_encoded.shape[-1]
                 full_encoded = self.encoder_mask_token.repeat(N, original_length, 1).to(x_encoded.device)  # [N, L, D_enc]
                 
                 for i in range(N):
-                    # 有效的encoder token数量（不含cls）
+                    # Number of valid encoder tokens (excluding cls)
                     valid_len = int(keep_mask[i].sum().item() - 1)
                     if valid_len > 0:
                         ids_keep = ids_keep_list[i]
-                        # x_encoded中去掉cls后的前valid_len即为保留token的表示，顺序与ids_keep一致
+                        # The first valid_len entries after removing cls correspond to the kept tokens
                         full_encoded[i, ids_keep, :] = x_encoded[i, 1:1 + valid_len, :]
                 
-                # 2) 在完整序列上加入 decoder 位置编码（若维度匹配），再进行语义嵌入，并拿到注意力权重
+                # 2) Add decoder positional embeddings (when dimensions match) and compute semantic attention
                 if full_encoded.shape[-1] == self.decoder_pos_embed.shape[-1]:
                     pos_full = self.decoder_pos_embed[:, 1:original_length + 1, :].to(full_encoded.device)
                     full_encoded = full_encoded + pos_full
                 _, attention_weights = self.apply_semantic_encoding(full_encoded, return_attention_weights=True)
                 
-                # 3) 打印每个用户目的地序列的最大权重语义表征序号
+                # 3) Log the most influential semantic component for each user's destination sequence
                 if attention_weights is not None and uid is not None and destination_start_list is not None and destination_end_list is not None:
                     # attention_weights: [N, num_semantic_parts, L, 1]
                     max_semantic_indices_full = torch.argmax(attention_weights.squeeze(-1), dim=1)  # [N, L]
@@ -587,14 +587,14 @@ class MaskedAutoEncoder(nn.Module):
                         if dest_end > dest_start:
                             dest_semantic_indices = max_semantic_indices_full[i, dest_start:dest_end + 1]
                             dest_semantic_list = dest_semantic_indices.detach().cpu().tolist()
-                            # 统计分布（转为纯Python整数，避免打印设备信息）
+                            # Summarize the distribution using plain Python integers for readability
                             vals, cnts = torch.unique(dest_semantic_indices, return_counts=True)
                             dist = {int(v.item()): int(c.item()) for v, c in zip(vals, cnts)}
-                            print(f"[推理] 用户 {user_id} 的目的地序列语义表征序号: {dest_semantic_list}")
-                            print(f"  - 目的地序列长度: {dest_end - dest_start + 1}")
-                            print(f"  - 语义表征分布: {dist}")
+                            print(f"The semantic representation number of the user {user_id}'s destination sequence: {dest_semantic_list}")
+                            print(f"  - Length: {dest_end - dest_start + 1}")
+                            print(f"  - Semantic representation distribution: {dist}")
                 
-                # 4) 解码阶段：在保留token上加入 decoder 位置编码（若维度匹配）后做语义嵌入
+                # 4) Add decoder positional embeddings (if compatible) to the kept tokens and run semantic fusion
                 x_no_cls_for_sem = x_no_cls
                 if x_no_cls.shape[-1] == self.decoder_pos_embed.shape[-1]:
                     L_keep = x_no_cls.shape[1]
@@ -602,7 +602,7 @@ class MaskedAutoEncoder(nn.Module):
                     x_no_cls_for_sem = x_no_cls + pos_keep
                 semantic_enhanced = self.apply_semantic_encoding(x_no_cls_for_sem, return_attention_weights=False)
             else:
-                # 训练阶段：在保留token上做语义嵌入，并缓存注意力用于正则
+                # During training, fuse semantics on kept tokens and cache attention for regularization
                 x_no_cls_for_sem = x_no_cls
                 if x_no_cls.shape[-1] == self.decoder_pos_embed.shape[-1]:
                     L_keep = x_no_cls.shape[1]
@@ -615,7 +615,7 @@ class MaskedAutoEncoder(nn.Module):
                 self._last_attention_valid_mask = keep_mask[:, 1:]  # [N, L_keep]
             
             if semantic_enhanced is not None:
-                # 单次解码：将 cross-attended 的语义增强表示与 CLS 拼接后送入解码器
+                # Decode once by concatenating the semantic-enhanced tokens with the CLS token
                 cls_tokens = x_encoded[:, :1, :]  # [N, 1, embed_dim]
                 current_with_cls = torch.cat([cls_tokens, semantic_enhanced], dim=1)
                 final_output = self._decode_single_semantic(
@@ -623,15 +623,15 @@ class MaskedAutoEncoder(nn.Module):
                 )
                 return final_output
 
-        # 如果没有语义编码，使用原始decoder
-        # 清空正则缓存，防止沿用上一批次
+        # If semantic encoding is disabled, fall back to the vanilla decoder
+        # Clear the cached attention values to avoid reusing outdated information
         self._last_attention_weights = None
         self._last_attention_valid_mask = None
         return self._decode_single_semantic(x_encoded, ids_keep_list, ids_restore_list, keep_mask, original_length)
     
     def _decode_single_semantic(self, x_encoded, ids_keep_list, ids_restore_list, keep_mask, original_length):
         """
-        对单个语义表征进行decoder处理（原始decoder逻辑）
+        Decode a single semantic representation using the original decoder flow.
         """
         N = len(ids_keep_list)
         
@@ -685,7 +685,7 @@ class MaskedAutoEncoder(nn.Module):
         cls_tokens = x[:, :1, :]  # [N, 1, D] - keep cls token from encoder
         x_full = torch.cat([cls_tokens, x_full], dim=1)  # [N, L+1, D]
         
-    # 位置编码在语义融合前已加入，这里不再添加 decoder_pos_embed
+        # Positional encodings were already applied during semantic fusion; no extra decoder_pos_embed needed here
         
         # Apply Transformer blocks (using Encoder as Decoder)
         for blk in self.decoder_blocks:
@@ -738,14 +738,14 @@ class MaskedAutoEncoder(nn.Module):
     
     def forward_loss_detailed(self, original, pred, mask, valid_mask=None):
         """
-        计算详细的损失信息，返回重建损失和多样性损失的分别值
+        Provide a detailed breakdown of the loss components.
         Args:
-            original: [N, L, D] 原始输入
-            pred: [N, L, D] 预测输出
-            mask: [N, L] 掩码
-            valid_mask: [N, L] 有效位置掩码
+            original: [N, L, D] original input
+            pred: [N, L, D] reconstructed output
+            mask: [N, L] mask over positions
+            valid_mask: [N, L] validity mask
         Returns:
-            dict: 包含各种损失的字典
+            dict: dictionary containing each loss component
         """
         if valid_mask is None:
             valid_mask = torch.ones_like(mask, dtype=torch.bool)
@@ -771,13 +771,13 @@ class MaskedAutoEncoder(nn.Module):
         # Apply mask and compute mean loss on masked positions
         reconstruction_loss = (mse_loss * loss_mask.float()).sum() / loss_mask.sum()
         
-        # 计算语义多样性损失（如果启用了语义编码）
+        # Compute semantic diversity penalty when semantic encoding is active
         diversity_loss = self.compute_semantic_diversity_loss()
 
-        # 注意力分布正则（训练阶段才会缓存注意力）
+        # Attention distribution regularization (only populated during training)
         attn_reg_loss = self.compute_attention_reg_loss()
         
-        # 总损失
+        # Total loss
         total_loss = reconstruction_loss + diversity_loss + attn_reg_loss
         
         return {
@@ -792,12 +792,12 @@ class MaskedAutoEncoder(nn.Module):
     
     def compute_semantic_diversity_loss(self):
         """
-        计算语义表征多样性损失：所有互不相同表征的余弦相似度之和并归一化
-        使用高效的矩阵运算实现
+        Compute the semantic diversity loss by aggregating pairwise cosine similarities
+        between distinct semantic representations.
         Returns:
-            diversity_loss: 多样性损失值
+            diversity_loss: scalar diversity penalty
         """
-        # 如果没有语义编码或语义部分数量少于2，则不计算多样性损失
+        # Skip the diversity penalty when semantic encoding is disabled or has fewer than two parts
         if (self.num_semantic_parts <= 1 or 
             self.semantic_parts_embedding is None):
             return torch.tensor(0.0, device=next(self.parameters()).device)
@@ -805,34 +805,33 @@ class MaskedAutoEncoder(nn.Module):
         # semantic_parts_embedding: [N, num_semantic_parts, embed_dim]
         N, num_parts, embed_dim = self.semantic_parts_embedding.shape
         
-        # 归一化语义表征以计算余弦相似度
+        # Normalize semantic representations before cosine similarity
         semantic_normalized = F.normalize(self.semantic_parts_embedding, p=2, dim=-1)  # [N, num_parts, embed_dim]
         
-        # 计算所有表征对之间的余弦相似度矩阵
-        # 通过矩阵乘法计算：[N, num_parts, embed_dim] @ [N, embed_dim, num_parts] = [N, num_parts, num_parts]
+        # Pairwise cosine similarity via batched matrix multiplication
+        # [N, num_parts, embed_dim] @ [N, embed_dim, num_parts] = [N, num_parts, num_parts]
         cosine_matrix = torch.bmm(semantic_normalized, semantic_normalized.transpose(1, 2))  # [N, num_parts, num_parts]
         
-        # 创建上三角掩码，排除对角线元素（自己与自己的相似度）
+        # Upper-triangular mask excludes self-similarity terms
         mask = torch.triu(torch.ones(num_parts, num_parts, device=cosine_matrix.device), diagonal=1).bool()
         
-        # 只保留上三角部分（不包括对角线），避免重复计算
+        # Retain only the upper-triangular elements to avoid double counting
         upper_triangle_similarities = cosine_matrix[:, mask]  # [N, num_pairs]
         
-        # 计算平均余弦相似度的平方，避免通过负相关“取巧”
+        # Average squared cosine similarity discourages degenerate negative correlations
         average_cosine_similarity = upper_triangle_similarities.pow(2).mean()
         
-        # 多样性损失：我们希望余弦相似度尽可能小（表征尽可能不同）
-        # 因此损失为相似度的平均值，乘以权重系数
+        # Multiply by the diversity weight so that lower similarity implies lower penalty
         diversity_loss = self.lambda_diversity * average_cosine_similarity
         
         return diversity_loss
 
     def compute_attention_reg_loss(self):
         """
-        基于注意力分布的正则：
-        - 熵正则：鼓励在语义部分维度上的分布更均匀（更高的熵）
-        - 可选最大权重惩罚：抑制单一语义部分的过大权重
-        Returns: 标量损失（已乘以对应权重）
+        Regularize the semantic attention distribution via:
+        - Entropy regularization to encourage balanced attention across semantic parts.
+        - Optional maximum-weight penalty to prevent dominance of a single part.
+        Returns: scalar loss value (weights applied internally).
         """
         if self._last_attention_weights is None:
             return torch.tensor(0.0, device=next(self.parameters()).device)
@@ -845,22 +844,22 @@ class MaskedAutoEncoder(nn.Module):
         else:
             valid_mask = self._last_attention_valid_mask  # [N, L]
 
-        # 熵正则（按语义部分维度）
+        # Entropy regularization across the semantic dimension
         eps = 1e-8
-        # 熵：-sum p log p；对P做归一化，使最大熵为1
+        # Entropy: -sum p log p; normalize by log(P) so the maximum entropy equals 1
         entropy = -(attn * (attn + eps).log()).sum(dim=1)  # [N, L]
         P = attn.shape[1]
         max_entropy = torch.log(torch.tensor(float(P), device=attn.device))
         normalized_entropy = entropy / (max_entropy + eps)  # [N, L]
 
-        # 仅在有效位置上取平均
+        # Average over valid temporal positions only
         valid_float = valid_mask.float()
         entropy_mean = (normalized_entropy * valid_float).sum() / (valid_float.sum() + eps)
 
-        # 损失希望熵越高越好 => loss = 1 - 平均熵
+        # Encourage high entropy: loss term becomes 1 - mean entropy
         entropy_reg = self.lambda_attn_reg * (1.0 - entropy_mean)
 
-        # 最大权重惩罚（可选）
+        # Optional penalty on maximum attention weights
         max_w = attn.max(dim=1).values  # [N, L]
         target = 1.0 / float(P)
         max_penalty = ((max_w - target).clamp(min=0.0) ** 2)
@@ -874,32 +873,32 @@ class MaskedAutoEncoder(nn.Module):
         """
         Forward pass with new semantic encoding system and diversity loss
         x: [N, L, D] input sequence (hometown + destination concatenated)
-        mask_lambda: 已弃用参数，保留为向后兼容
+        mask_lambda: deprecated knob retained for backward compatibility
         hometown_len_list: list of int, length of hometown sequence for each sample
         destination_start_list: list of int, start position of destination sequence
         destination_end_list: list of int, end position of destination sequence
         valid_mask: [N, L] mask indicating valid positions (True for valid, False for padding)
-        use_semantic_masking: 已弃用参数，保留为向后兼容
-        
-        新语义编码系统工作流程:
-        1. 使用 set_external_cls_token() 设置 LLM embedding 作为语义编码基础 (F_c)
-        2. 通过 F_p = F_c ◦ sigmoid(W_{c2} tanh(W_{c1} F_c)) 生成 num_semantic_parts 个语义表征
-        3. Encoder 阶段使用标准随机masking
-        4. Decoder 阶段对每个语义表征分别处理，最后归一化相加得到最终预测
-        
-        损失函数组成:
-        - 重建损失: 标准的MSE损失，计算masked位置的重建误差
-        - 多样性损失: 计算所有语义表征对之间的余弦相似度，鼓励表征多样性
-        - 总损失 = 重建损失 + lambda_diversity * 多样性损失
-        
-        当 num_semantic_parts = 0 时，使用标准的MAE流程（无语义增强，无多样性损失）
-        当 num_semantic_parts <= 1 时，不计算多样性损失
+        use_semantic_masking: deprecated toggle retained for backward compatibility
+
+        Workflow of the semantic encoding system:
+        1. Call set_external_cls_token() to provide the LLM embedding baseline (F_c).
+        2. Generate num_semantic_parts semantic representations via F_p = F_c ◦ sigmoid(W_{c2} tanh(W_{c1} F_c)).
+        3. The encoder applies standard random masking.
+        4. The decoder processes each semantic representation and aggregates the outputs.
+
+        Loss composition:
+        - Reconstruction loss: mean squared error on masked positions.
+        - Diversity loss: pairwise cosine similarity penalty encouraging diverse semantics.
+        - Total = reconstruction loss + lambda_diversity * diversity loss + attention regularization.
+
+        When num_semantic_parts = 0, the model reduces to a standard MAE (no semantic augmentation, no diversity loss).
+        When num_semantic_parts <= 1, the diversity loss is skipped.
         """
-        # 在每次前向前重算语义表征，保证语义投影层的梯度链路有效
+        # Refresh semantic projections each forward pass to keep gradients flowing through projection layers
         if self.num_semantic_parts > 0 and self.external_cls_token is not None:
             # self.external_cls_token: [N, 1, D] -> [N, D]
             P_L_current = self.external_cls_token.squeeze(1)
-            # 根据当前批次的外部CLS重新生成语义部分
+            # Regenerate semantic parts based on the current batch of external CLS embeddings
             self._generate_semantic_parts(P_L_current)
 
         original_length = x.shape[1]

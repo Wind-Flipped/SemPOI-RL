@@ -1,23 +1,10 @@
 # -*- coding: utf-8 -*-
 from ast import parse
-# import os
-# os.environ["CUDA_VISIBLE_DEVICES"] = "1, 2"  # Set the visible GPU device
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3'
-import torch
-import torch.nn as nn
-from torch.nn.utils.rnn import pad_sequence
-from torch.optim import Adam
-from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader
-import torch.nn.functional as F
 
 import argparse
-from collections import namedtuple, defaultdict
-import numpy as np
-import os
-import sys
-from copy import copy
 import warnings
 warnings.filterwarnings('ignore')
 try:
@@ -26,7 +13,7 @@ except:
     pass
 
 from utils import *
-from data import TravelDataset, random_split, KGDataset
+from data import TravelDataset, random_split
 from model import SemPOIModel
 import metrics
 from trainer import *
@@ -65,22 +52,17 @@ def main():
     parser.add_argument('--log_path', type=str, default='../')
     parser.add_argument('--log', action="store_true")
     parser.add_argument('--name', type=str, default="default")
-    # parser.add_argument('--model', type=str, default="base")
     parser.add_argument('--device', type=str, default="cuda:0")
     parser.add_argument("--stop_epoch", type=int, default=2) # early stopping
     parser.add_argument("--fine_stop", type=int, default=12)
-    # Model (lm).
-    parser.add_argument("--lm_hid_layers", type=int, default=3, help="Number of hidden layers in intensity function.")
-    parser.add_argument("--lm_latent_dim", type=int, default=128, help="Hidden layer dimension in intensity function.")
-    parser.add_argument("--sig_v", type=float, default=0.6, help="Observation variance.")  # Note: F 0.6 For Yelp, use 0.4
 
-    parser.add_argument("--s_infer", action="store_true")
     parser.add_argument("--use_llm", action="store_true", help="Use LLM for training")
     parser.add_argument("--use_target_llm", action="store_true", help="Use target LLM for training")
     parser.add_argument("--use_vllm", action="store_true", help="Use vllm for training")
     parser.add_argument("--llm_embedding_dim", type=int, default=256, help="Embedding dimension for LLM")
     parser.add_argument("--use_lora", action="store_true", help="Use LLM trained with LoRA for training")
     parser.add_argument("--lora_path", type=str, default="./grpo_travel_style_lora_model/checkpoint-5500", help="Path to the LoRA model")
+    parser.add_argument("--lora_path2", type=str, default=None, help="Path to the second LoRA model. Used for reinforcement learning")
     parser.add_argument("--dataset_path", type=str, default="../dataset/Yelp_20250714_192438", help="Path to the dataset for LLM training")
     parser.add_argument("--st_module", action="store_true", help="use SpatialTemporal module")
     # Semantic Masking parameters

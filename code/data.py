@@ -1,16 +1,8 @@
-from random import shuffle, choice
-import numpy as np
-import scipy.sparse as sp
 from copy import copy
 from collections import defaultdict
 from torch.utils.data import Dataset, Subset
 import pandas as pd
 import collections
-from os.path import join
-import torch
-import json
-# import dgl
-import os
 import pickle
 from collections import Counter
 
@@ -31,118 +23,6 @@ def convert_timestamp(region, timestamp, city_tz_mapping):
     local_dt = dt_utc.astimezone(local_tz)
     return local_dt, local_dt.hour
 
-
-def compute_trajectory_duration(trajectory):
-    times = []
-    for point in trajectory:
-        ts = point[2]
-        ts_sec = int(ts)
-        dt = datetime.fromtimestamp(ts_sec, tz=timezone.utc)
-        times.append(dt)
-    if not times:
-        return None, None, None, None, None
-    min_time = min(times)
-    max_time = max(times)
-    duration = max_time - min_time
-    return duration, min_time, max_time
-
-class KGDataset(Dataset):
-    """
-    A custom dataset class for handling knowledge graph (KG) data in machine learning models.
-    This class processes and stores knowledge graph data, including entities, relations, and triples.
-    """
-    def __init__(self, args):
-        kg_data = pd.read_csv(args.kg_path, sep='\t', names=['h', 'r', 't'], engine='python')
-        self.kg_data = kg_data.drop_duplicates()
-        self.kg_dict, self.heads = self.generate_kg_data(kg_data=self.kg_data)
-        self.args = args
-
-    @property
-    def entity_count(self):
-        """
-        Returns the total count of unique entities in the knowledge graph.
-        Returns:
-            int
-        """
-        # start from one
-        return self.kg_data['t'].max() + 2
-
-    @property
-    def relation_count(self):
-        """
-        Returns the total count of unique relations in the knowledge graph.
-        Returns:
-            int
-        """
-        return self.kg_data['r'].max()+2
-
-    def get_kg_dict(self, poi_num):
-        """
-        Generates a dictionary with POI-specific KG entity and relation information.
-        Returns:
-            dict
-        """
-        entity_num = self.args.entity_num_per_poi # 2
-        p2es = dict()
-        p2rs = dict()
-        for poi in range(poi_num):
-            rts = self.kg_dict.get(poi, False)
-            if rts:
-                tails = list(map(lambda x:x[1], rts))
-                relations = list(map(lambda x:x[0], rts))
-                if(len(tails) >= entity_num):
-                    p2es[poi] = torch.IntTensor(tails).to(self.args.device)[:entity_num]
-                    p2rs[poi] = torch.IntTensor(relations).to(self.args.device)[:entity_num]
-                else:
-                    # last embedding pos as padding idx
-                    tails.extend([self.entity_count]*(entity_num-len(tails)))
-                    relations.extend([self.relation_count]*(entity_num-len(relations)))
-                    p2es[poi] = torch.IntTensor(tails).to(self.args.device)
-                    p2rs[poi] = torch.IntTensor(relations).to(self.args.device)
-            else:
-                p2es[poi] = torch.IntTensor([self.entity_count]*entity_num).to(self.args.device)
-                p2rs[poi] = torch.IntTensor([self.relation_count]*entity_num).to(self.args.device)
-        return p2es, p2rs
-
-
-    def generate_kg_data(self, kg_data):
-        """
-        Constructs a dictionary representation of the knowledge graph.
-        Returns:
-            dict
-            list
-        """
-        kg_dict = collections.defaultdict(list)
-        for row in kg_data.iterrows():
-            h, r, t = row[1]
-            kg_dict[h].append((r, t))
-        heads = list(kg_dict.keys())
-        return kg_dict, heads
-
-    def __len__(self):
-        """
-        Returns the total number of head entities in the knowledge graph.
-        Returns:
-            int
-        """
-        return len(self.kg_dict)
-
-    def __getitem__(self, index):
-        """
-        Retrieves a KG triple (head, relation, positive tail, negative tail) at a specified index.
-        Returns:
-            tuple
-        """
-        head = self.heads[index]
-        relation, pos_tail = random.choice(self.kg_dict[head])
-        while True:
-            neg_head = random.choice(self.heads)
-            neg_tail = random.choice(self.kg_dict[neg_head])[1]
-            if (relation, neg_tail) in self.kg_dict[head]:
-                continue
-            else:
-                break
-        return head, relation, pos_tail, neg_tail
 
 class TravelDataset(Dataset):
     """
@@ -736,13 +616,7 @@ def extract_and_save_poi_metadata(dataset_name):
 
 
 if __name__ == '__main__':
-    # args = type('', (), {})()  # Create an empty object to mimic args
-    # args.dataset_name = 'Yelp'
 
-    # travel_dataset = TravelTextDataset(args, f'../{args.dataset_name}/home.txt', f'../{args.dataset_name}/oot.txt', f'../{args.dataset_name}/travel.txt')
-    # text_pairs = travel_dataset.generate_json()
-    # with open(f'../data/{args.dataset_name}.json', 'w') as f:
-    #     json.dump(text_pairs, f)
     dataset_name = 'Yelp'
     poi_meta = extract_and_save_poi_metadata(dataset_name)
     print(f"Extracted and saved metadata for {len(poi_meta)} POIs")

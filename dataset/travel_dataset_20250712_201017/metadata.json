@@ -1,0 +1,10 @@
+{
+  "dataset_size": 3007,
+  "creation_time": "20250712_201017",
+  "model_name": "../LLMs/Qwen3-8B",
+  "successful_samples": 3007,
+  "failed_samples": 0,
+  "success_rate": 100.0,
+  "batch_size": 4,
+  "processing_mode": "batch_parallel"
+}

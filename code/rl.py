@@ -57,128 +57,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# Standalone reward functions (following the pattern in test.py)
-def travel_style_similarity_reward_func(similarity_model, prompts, completions, reference_responses, **kwargs) -> list[
-    float]:
-    """
-    Travel-style similarity reward function.
-
-    Args:
-        similarity_model: Model instance used to compute similarity.
-        prompts: List of input prompts.
-        completions: List of model-generated completions.
-        reference_responses: List of reference answers.
-        **kwargs: Additional optional arguments.
-
-    Returns:
-        list[float]: List of reward values.
-    """
-    from sklearn.metrics.pairwise import cosine_similarity
-
-    responses = [completion[0]['content'] if isinstance(completion, list) else completion for completion in completions]
-    rewards = []
-
-    print(f"\n{'=' * 80}")
-    print(f"Similarity reward computation - processing {len(responses)} generated responses")
-    print(f"{'=' * 80}")
-
-    for i, response in enumerate(responses):
-        if i < len(reference_responses):
-            reference = reference_responses[i]
-
-            try:
-                # Encode text
-                embeddings = similarity_model.encode([response, reference])
-
-                # Compute cosine similarity
-                similarity = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
-
-                # Ensure similarity stays within [0, 1]
-                similarity = max(0.0, min(1.0, similarity))
-
-                # Convert similarity to reward score
-                reward = similarity
-                rewards.append(reward)
-
-                # Log detailed information
-                print(f"\nSample {i + 1}:")
-                print(f"Prompt: {prompts[i][:100]}..." if len(prompts[i]) > 100 else f"Prompt: {prompts[i]}")
-                print(f"Generated reply: {response[:150]}..." if len(response) > 150 else f"Generated reply: {response}")
-                print(f"Reference answer: {reference[:150]}..." if len(reference) > 150 else f"Reference answer: {reference}")
-                print(f"Similarity: {similarity:.4f}")
-                print(f"Similarity reward: {reward:.4f}")
-                print(f"{'-' * 60}")
-
-            except Exception as e:
-                logger.error(f"Error calculating similarity reward: {e}")
-                rewards.append(0.0)
-                print(f"Sample {i + 1}: Similarity computation failed, reward set to 0.0")
-        else:
-            rewards.append(0.0)
-            print(f"Sample {i + 1}: Missing reference answer, reward set to 0.0")
-
-    avg_similarity_reward = sum(rewards) / len(rewards) if rewards else 0.0
-    print(f"\nAverage similarity reward: {avg_similarity_reward:.4f}")
-    print(f"{'=' * 80}\n")
-
-    return rewards
-
-
-def travel_style_length_reward_func(prompts, completions, reference_responses, **kwargs) -> list[float]:
-    """
-    Travel-style length reward function.
-
-    Args:
-        prompts: List of input prompts.
-        completions: List of model-generated completions.
-        reference_responses: List of reference answers.
-        **kwargs: Additional optional arguments.
-
-    Returns:
-        list[float]: List of reward values.
-    """
-    responses = [completion[0]['content'] if isinstance(completion, list) else completion for completion in completions]
-    rewards = []
-
-    print(f"\n{'=' * 80}")
-    print(f"Length reward computation - processing {len(responses)} generated responses")
-    print(f"{'=' * 80}")
-
-    for i, response in enumerate(responses):
-        if i < len(reference_responses):
-            reference = reference_responses[i]
-
-            predicted_length = len(response.split())
-            reference_length = len(reference.split())
-
-            # Compute the length difference ratio
-            if reference_length > 0:
-                length_diff = abs(predicted_length - reference_length) / reference_length
-                # The closer the lengths, the higher the reward
-                length_reward = max(0, 1 - length_diff) * 0.5
-                rewards.append(length_reward)
-
-                # Log detailed information
-                print(f"Sample {i + 1}:")
-                print(f"Generated length: {predicted_length} words")
-                print(f"Reference length: {reference_length} words")
-                print(f"Length difference ratio: {length_diff:.4f}")
-                print(f"Length reward: {length_reward:.4f}")
-                print(f"{'-' * 60}")
-            else:
-                rewards.append(0.0)
-                print(f"Sample {i + 1}: Reference length is 0, reward set to 0.0")
-        else:
-            rewards.append(0.0)
-            print(f"Sample {i + 1}: Missing reference answer, reward set to 0.0")
-
-    avg_length_reward = sum(rewards) / len(rewards) if rewards else 0.0
-    print(f"\nAverage length reward: {avg_length_reward:.4f}")
-    print(f"{'=' * 80}\n")
-
-    return rewards
-
-
 # ===================== F1 reward based on the SPOTModel ===================== #
 class _RLArgsStub:
     """Minimal parameter object that satisfies the fields required for SPOTModel inference."""
@@ -186,8 +64,7 @@ class _RLArgsStub:
     def __init__(self, device="cuda:1", use_llm=True, use_target_llm=True,
                  use_vllm=False, use_lora=False, lora_path="./grpo_travel_style_lora_model/checkpoint-5500",
                  llm_embedding_dim=256, hidden_size=256,
-                 kg=False, ode=False, s_infer=False, st_module=True,
-                 lm_hid_layers=3, lm_latent_dim=128,
+                 kg=False, ode=False, st_module=True,
                  dyn_hid_layers=3, dyn_latent_dim=128,
                  tau=0.2, sig_v=0.6, confidence=0.5,
                  num_semantic_parts=8, lambda_diversity=0.1,
@@ -203,10 +80,7 @@ class _RLArgsStub:
         self.hidden_size = hidden_size
         self.kg = kg
         self.ode = ode
-        self.s_infer = s_infer
         self.st_module = st_module
-        self.lm_hid_layers = lm_hid_layers
-        self.lm_latent_dim = lm_latent_dim
         self.dyn_hid_layers = dyn_hid_layers
         self.dyn_latent_dim = dyn_latent_dim
         self.tau = tau
@@ -292,8 +166,7 @@ class F1RewardEvaluator:
             d_model=args_stub.hidden_size,
             n_head=4,
             num_encoder_layers=1,
-            d_z=args_stub.hidden_size,
-            kg_dataset=None,
+            d_z=args_stub.hidden_size
         )
         model = model.to(self.device)
 
@@ -376,135 +249,6 @@ class F1RewardEvaluator:
         )
         return loader
 
-    def compute_batch_f1(self, prompts, completions) -> list[float]:
-        """
-        Given a batch of RL-generated text, pick the samples in the dataset with matching order,
-        feed the text into the model as messages, and return the sample_f1 for each sample.
-        """
-        self._lazy_load_data_and_model()
-        msgs = self._tensorize_messages(completions)
-
-        bsz = len(msgs)
-        N = len(self._data)
-        # Take consecutive indices with wrap-around if necessary
-        idxs = [ (self._offset + i) % N for i in range(bsz) ]
-        self._offset = (self._offset + bsz) % N
-
-        loader = self._get_subset_loader(idxs, batch_size=bsz)
-
-        f1_scores: list[float] = []
-        # Iterate through a batch (ideally only one because batch_size == bsz)
-        with torch.no_grad():
-            for (uid, o_ck, d_ck, masked_d_ck, o_h, d_h, masked_d_h, o_t, d_t, o_l, d_l, o_pad, d_pad, o_rg, d_rg) in loader:
-                # Feed the messages list to the forward pass
-                uid = uid.to(self.device)
-                o_ck = o_ck.to(self.device)
-                masked_d_ck = masked_d_ck.to(self.device)
-                d_ck = d_ck.to(self.device)
-                o_h = o_h.to(self.device)
-                masked_d_h = masked_d_h.to(self.device)
-                d_h = d_h.to(self.device)
-                o_t = o_t.to(self.device)
-                d_t = d_t.to(self.device)
-                o_l = o_l.to(self.device)
-                d_l = d_l.to(self.device)
-                o_pad = o_pad.to(self.device)
-                d_pad = d_pad.to(self.device)
-                o_rg = o_rg.to(self.device)
-                d_rg = d_rg.to(self.device)
-
-                # Predict
-                predicted_ids = self._model(uid, msgs, o_ck, masked_d_ck, o_t, d_t, o_l, d_l, o_pad, d_pad, d_ck, o_rg,
-                                      d_rg, target_seq=None)
-
-                # Compute F1 per sample
-                for i in range(predicted_ids.shape[0]):
-                    sample_pred = predicted_ids[i].cpu()  # shape: [seq_len]
-                    sample_target = d_ck[i].cpu()  # shape: [seq_len]
-
-                    # Exclude padded values (assuming padding is represented by 0)
-                    non_padded_indices = sample_target != 0
-                    sample_pred = sample_pred[non_padded_indices]
-                    sample_target = sample_target[non_padded_indices]
-                    sample_pred = sample_pred[1:-1]  # Exclude start and end tokens
-                    sample_target = sample_target[1:-1]  # Exclude start and end tokens
-                    f1 = self._sample_f1(sample_pred, sample_target)
-                    f1_scores.append(float(max(0.0, min(1.0, f1))))
-
-        # Align with the number of inputs (should match theoretically)
-        if len(f1_scores) < bsz:
-            f1_scores += [0.0] * (bsz - len(f1_scores))
-        elif len(f1_scores) > bsz:
-            f1_scores = f1_scores[:bsz]
-        return f1_scores
-
-    def compute_batch_f1_category(self, prompts, completions) -> list[float]:
-        """
-        Given a batch of RL-generated text, pick the samples in the dataset with matching order,
-        feed the text into the model as messages, and return sample_f1 and category consistency
-        for each sample.
-        """
-        self._lazy_load_data_and_model()
-        msgs = self._tensorize_messages(completions)
-
-        bsz = len(msgs)
-        N = len(self._data)
-        # Take consecutive indices with wrap-around if necessary
-        idxs = [ (self._offset + i) % N for i in range(bsz) ]
-        self._offset = (self._offset + bsz) % N
-
-        loader = self._get_subset_loader(idxs, batch_size=bsz)
-
-        f1_scores: list[float] = []
-        cat_scores: list[float] = []
-        # Iterate through a batch (ideally only one because batch_size == bsz)
-        with torch.no_grad():
-            for (uid, o_ck, d_ck, masked_d_ck, o_h, d_h, masked_d_h, o_t, d_t, o_l, d_l, o_pad, d_pad, o_rg, d_rg) in loader:
-                # Feed the messages list to the forward pass
-                uid = uid.to(self.device)
-                o_ck = o_ck.to(self.device)
-                masked_d_ck = masked_d_ck.to(self.device)
-                d_ck = d_ck.to(self.device)
-                o_h = o_h.to(self.device)
-                masked_d_h = masked_d_h.to(self.device)
-                d_h = d_h.to(self.device)
-                o_t = o_t.to(self.device)
-                d_t = d_t.to(self.device)
-                o_l = o_l.to(self.device)
-                d_l = d_l.to(self.device)
-                o_pad = o_pad.to(self.device)
-                d_pad = d_pad.to(self.device)
-                o_rg = o_rg.to(self.device)
-                d_rg = d_rg.to(self.device)
-
-                # Predict
-                predicted_ids = self._model(uid, msgs, o_ck, masked_d_ck, o_t, d_t, o_l, d_l, o_pad, d_pad, d_ck, o_rg,
-                                      d_rg, target_seq=None)
-
-                # Compute F1 per sample
-                for i in range(predicted_ids.shape[0]):
-                    sample_pred = predicted_ids[i].cpu()  # shape: [seq_len]
-                    sample_target = d_ck[i].cpu()  # shape: [seq_len]
-
-                    # Exclude padded values (assuming padding is represented by 0)
-                    non_padded_indices = sample_target != 0
-                    sample_pred = sample_pred[non_padded_indices]
-                    sample_target = sample_target[non_padded_indices]
-                    sample_pred = sample_pred[1:-1]  # Exclude start and end tokens
-                    sample_target = sample_target[1:-1]  # Exclude start and end tokens
-                    f1 = self._sample_f1(sample_pred, sample_target)
-                    f1_scores.append(f1)
-                    # Compute category consistency
-                    cat_rate = category_consistency_rate(sample_pred, sample_target, self.poi_meta)
-                    cat_scores.append(cat_rate)
-
-        # Align with the number of inputs (should match theoretically)
-        if len(f1_scores) < bsz:
-            f1_scores += [0.0] * (bsz - len(f1_scores))
-        elif len(f1_scores) > bsz:
-            f1_scores = f1_scores[:bsz]
-        return f1_scores, cat_scores
-
     def compute_Refine_POI_reward(self, prompts, completions) -> list[float]:
         """
         Given a batch of RL-generated text, pick the samples in the dataset with matching order,
@@ -575,41 +319,6 @@ class F1RewardEvaluator:
 
         return hit_scores, recall_scores, devisity_scores, cat_scores
 
-def travel_style_f1_reward_func(evaluator: F1RewardEvaluator, prompts, completions, reference_responses, **kwargs) -> list[float]:
-    """
-    Compute the sample-level F1 reward using the saved SPOTModel.
-    The return value is within [0, 1], matching the semantics of sample_f1 in trainer.py.
-    """
-    # Directly call the evaluator
-    # try:
-    #     rewards = evaluator.compute_batch_f1(prompts, completions)
-    # except Exception as e:
-    #     print(f"[F1-Reward] computation failed: {e}")
-    #     rewards = [0.0 for _ in range(len(completions))]
-    rewards = evaluator.compute_batch_f1(prompts, completions)
-    # Print summary
-    if rewards:
-        print(f"F1 reward (mean): {sum(rewards)/len(rewards):.4f} | Samples: {len(rewards)}")
-    return rewards
-
-def travel_style_f1_category_reward_func(evaluator: F1RewardEvaluator, prompts, completions, reference_responses, **kwargs) -> list[float]:
-    """
-    Compute the sample-level F1 reward using the saved SPOTModel.
-    The return value is within [0, 1], matching the semantics of sample_f1 in trainer.py.
-    """
-    # Directly call the evaluator
-    # try:
-    #     rewards = evaluator.compute_batch_f1(prompts, completions)
-    # except Exception as e:
-    #     print(f"[F1-Reward] computation failed: {e}")
-    #     rewards = [0.0 for _ in range(len(completions))]
-    f1_rewards, cat_rewards = evaluator.compute_batch_f1_category(prompts, completions)
-    # Print summary
-    if f1_rewards:
-        print(f"F1 reward (mean): {sum(f1_rewards)/len(f1_rewards):.4f} | Samples: {len(f1_rewards)}")
-    if cat_rewards:
-        print(f"Category consistency reward (mean): {sum(cat_rewards)/len(cat_rewards):.4f} | Samples: {len(cat_rewards)}")
-    return f1_rewards, cat_rewards
 
 class TravelStyleGRPOTrainer:
     """Train a travel-style generation model using the GRPO method."""
@@ -741,10 +450,6 @@ class TravelStyleGRPOTrainer:
               logging_steps: int = 1,
               is_gspo: bool = False,
               use_Refine_POI_reward: bool = False,
-              use_f1_reward: bool = True,
-              acc_reward: float = 0.1,
-              use_category: bool = True,
-              category_reward: float = 0.05,
               ):
         """
         Train the model using GRPO.
@@ -884,119 +589,8 @@ class TravelStyleGRPOTrainer:
                 log_on_each_node=False,
                 use_vllm=False,
             )
+
         # Define reward functions while capturing reference_responses and progress tracking
-        def similarity_reward_func(prompts, completions, reference, **kwargs):
-            # Update progress bar
-            self.current_step += 1
-            self.training_progress.update(1)
-            self.training_progress.set_postfix({
-                'Step': f"{self.current_step}/{self.total_steps}",
-                'Phase': 'Similarity reward computation'
-            })
-
-            print(f"\n🔄 Step {self.current_step}/{self.total_steps}: Computing similarity reward")
-            similarity_rewards = travel_style_similarity_reward_func(self.similarity_model, prompts, completions,
-                                                                     reference, **kwargs)
-            # Log to SwanLab
-            if SWANLAB_AVAILABLE:
-                swanlab.log({
-                    "step": self.current_step,
-                    "reward/similarity": sum(similarity_rewards) / len(
-                        similarity_rewards) if similarity_rewards else 0.0,
-                    "progress": (self.current_step / self.total_steps) * 100
-                })
-            return similarity_rewards
-
-        def length_reward_func(prompts, completions, reference, **kwargs):
-            self.training_progress.set_postfix({
-                'Step': f"{self.current_step}/{self.total_steps}",
-                'Phase': 'Length reward computation'
-            })
-
-            print(f"\n📏 Step {self.current_step}/{self.total_steps}: Computing length reward")
-            return travel_style_length_reward_func(prompts, completions, reference, **kwargs)
-
-        def quality_reward_func(prompts, completions, reference, **kwargs):
-            self.training_progress.set_postfix({
-                'Step': f"{self.current_step}/{self.total_steps}",
-                'Phase': 'Quality reward computation'
-            })
-
-            # Compute and display the total reward
-            similarity_rewards = travel_style_similarity_reward_func(self.similarity_model, prompts, completions,
-                                                                     reference, **kwargs)
-            length_rewards = travel_style_length_reward_func(prompts, completions, reference, **kwargs)
-
-            total_rewards = [s + l for s, l in zip(similarity_rewards, length_rewards)]
-            avg_total_reward = sum(total_rewards) / len(total_rewards) if total_rewards else 0.0
-
-            print(f"\n🎯 Step {self.current_step}/{self.total_steps} summary:")
-            print(f"   Average total reward: {avg_total_reward:.4f}")
-            print(f"   Completion progress: {(self.current_step / self.total_steps) * 100:.1f}%")
-
-            # Log to SwanLab
-            if SWANLAB_AVAILABLE:
-                swanlab.log({
-                    "step": self.current_step,
-                    "reward/similarity": sum(similarity_rewards) / len(
-                        similarity_rewards) if similarity_rewards else 0.0,
-                    "reward/length": sum(length_rewards) / len(length_rewards) if length_rewards else 0.0,
-                    "reward/total": avg_total_reward,
-                    "progress": (self.current_step / self.total_steps) * 100
-                })
-
-            return total_rewards
-
-        def f1_reward_func(prompts, completions, reference, **kwargs):
-            self.training_progress.set_postfix({
-                'Step': f"{self.current_step}/{self.total_steps}",
-                'Phase': 'F1 reward computation'
-            })
-            if self.f1_evaluator is None:
-                logger.error("F1 evaluator unavailable, returning zero rewards")
-                return [0.0 for _ in range(len(completions))]
-            rewards = travel_style_f1_reward_func(self.f1_evaluator, prompts, completions, reference, **kwargs)
-            # Scale the F1 reward by the configured weight
-            scaled = [float(r) * float(acc_reward) for r in rewards]
-            print(f"Mean raw F1 reward: {sum(rewards)/len(rewards) if rewards else 0.0:.4f} | acc_reward weight={acc_reward} | Mean scaled reward: {sum(scaled)/len(scaled) if scaled else 0.0:.4f}")
-            if SWANLAB_AVAILABLE:
-                try:
-                    swanlab.log({
-                        "reward/f1_raw": sum(rewards)/len(rewards) if rewards else 0.0,
-                        "reward/f1": sum(scaled)/len(scaled) if scaled else 0.0,
-                        "acc_reward": acc_reward,
-                        "step": self.current_step
-                    })
-                except Exception:
-                    pass
-            return scaled
-
-        def f1_category_reward_func(prompts, completions, reference, **kwargs):
-            self.training_progress.set_postfix({
-                'Step': f"{self.current_step}/{self.total_steps}",
-                'Phase': 'F1 and category reward computation'
-            })
-            if self.f1_evaluator is None:
-                logger.error("F1 evaluator unavailable, returning zero rewards")
-                return [0.0 for _ in range(len(completions))]
-            f1_rewards, cat_rewards = travel_style_f1_category_reward_func(self.f1_evaluator, prompts, completions, reference, **kwargs)
-            # Scale the rewards by their respective weights
-            f1_scaled = [float(r) * float(acc_reward) for r in f1_rewards]
-            cat_scaled = [float(r) * float(category_reward) for r in cat_rewards]
-            scaled = [f + c for f, c in zip(f1_scaled, cat_scaled)]
-            print(f"Mean combined reward: {sum(scaled)/len(scaled) if scaled else 0.0:.4f}")
-            if SWANLAB_AVAILABLE:
-                try:
-                    swanlab.log({
-                        "reward/f1_raw": sum(f1_rewards)/len(f1_rewards) if f1_rewards else 0.0,
-                        "reward/f1": sum(f1_scaled)/len(f1_scaled) if f1_scaled else 0.0,
-                        "reward/cat_raw": sum(cat_rewards)/len(cat_rewards) if cat_rewards else 0.0,
-                        "reward/cat": sum(cat_scaled)/len(cat_scaled) if cat_scaled else 0.0,
-                        "step": self.current_step
-                    })
-                except Exception:
-                    pass
-            return scaled
         def Refine_POI_reward_func(prompts, completions, reference, **kwargs):
             self.training_progress.set_postfix({
                 'Step': f"{self.current_step}/{self.total_steps}",
@@ -1032,11 +626,9 @@ class TravelStyleGRPOTrainer:
         if self.use_accelerate:
             # Use accelerate to prepare the model and dataset
             model, dataset = self.accelerator.prepare(self.model, dataset)
-            reward_list = [similarity_reward_func]
-            if use_f1_reward and use_category:
-                reward_list.append(f1_category_reward_func)
-            elif use_f1_reward:
-                reward_list.append(f1_reward_func)
+            reward_list = []
+            if use_Refine_POI_reward:
+                reward_list = [Refine_POI_reward_func]
             trainer = GRPOTrainer(
                 model=model,
                 processing_class=self.tokenizer,
@@ -1045,14 +637,7 @@ class TravelStyleGRPOTrainer:
                 train_dataset=dataset,
             )
         else:
-            if self.need_similarity_model:
-                reward_list = [similarity_reward_func]
-            else:
-                reward_list = []
-            if use_f1_reward and use_category:
-                reward_list.append(f1_category_reward_func)
-            elif use_f1_reward:
-                reward_list.append(f1_reward_func)
+            reward_list = []
             if use_Refine_POI_reward:
                 reward_list = [Refine_POI_reward_func]
             trainer = GRPOTrainer(
@@ -1293,6 +878,7 @@ def main():
     wandb.init(mode="disabled")  # Explicitly disable wandb
     parser = argparse.ArgumentParser()
     parser.add_argument("--use_accelerate", action="store_true", help="Enable accelerate for training")
+    parser.add_argument("--lora_config", type=str, default=None, help="Path to existing SFT LoRA adapter config. Used for reinforcement learning.")
     # SFT-specific arguments
     parser.add_argument("--sft", action="store_true", help="Run supervised fine-tuning (SFT)")
     parser.add_argument("--sft_epochs", type=int, default=1, help="Number of epochs for SFT")
@@ -1307,27 +893,24 @@ def main():
     parser.add_argument("--dataset_name", type=str, default="Foursquare", help="Dataset name (Foursquare/Yelp)")
     args = parser.parse_args()
     dataset_name = args.dataset_name
-    args.sft_output = args.sft_output + f"_{dataset_name}_sftepoch1"
-    args.sft_project = args.sft_project + f"_{dataset_name}_sftepoch1"
-    args.sft_run_name = args.sft_run_name + f"_{dataset_name}_sftepoch1"
 
     from datasets import load_from_disk
     if dataset_name == "Foursquare":
         text_dataset = load_from_disk("../dataset/travel_dataset_20250712_201017")
-        output_dir = "./sft_grpo_Foursquare_f1_RefinePOI_newlora"
-        run_name = "Foursquare_sft_grpo_RefinePOI_newlora"
-        lora_config = "./sft_travel_style_lora_Foursquare_sftepoch1/checkpoint-376"
+        output_dir = "./sft_grpo_Foursquare_test"
+        run_name = "Foursquare_sft_grpo_test"
+        # lora_config = "./sft_travel_style_lora_Foursquare_sftepoch1"
     else:
         text_dataset = load_from_disk("../dataset/Yelp_20250714_192438")
-        output_dir = "./sft_grpo_Yelp_f1_epoch1_RefinePOI_newlora"
-        run_name = "Yelp_sft_grpo_epoch1_RefinePOI_newlora"
-        lora_config = "./sft_travel_style_lora_Yelp_sftepoch1/checkpoint-553"
+        output_dir = "./sft_grpo_Yelp_test"
+        run_name = "Yelp_sft_grpo_epoch1_test"
+        # lora_config = "./sft_travel_style_lora_Yelp_sftepoch1"
     trainer = TravelStyleGRPOTrainer(
         model_name="../LLMs/Qwen3-8B",
         model_run_name=dataset_name + "_semantic8_diversity0.1_attnreg0.1_mask0.75",
         dataset_name=dataset_name,
         use_lora=True,
-        lora_config=lora_config if not args.sft else None,
+        lora_config=args.lora_config if not args.sft else None,
         lora_r=16,
         lora_alpha=32,
         is_sft=args.sft,
@@ -1359,8 +942,6 @@ def main():
             per_device_train_batch_size=1,
             gradient_accumulation_steps=8,
             use_Refine_POI_reward=True,
-            use_category=True,
-            use_f1_reward=True,
             is_gspo=False
         )
 

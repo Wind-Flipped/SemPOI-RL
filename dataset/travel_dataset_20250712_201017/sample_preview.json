@@ -1,0 +1,17 @@
+[
+  {
+    "index": 0,
+    "prompt": "As a professional travel analyst and user profiling expert, analyze the user's POI (Point of Interest) trajectory data from their hometown to predict their potential travel style at their destination....",
+    "reference": "user's travel style is characterized by a casual, food-centric approach with a focus on local dining and relaxation. The trajectory shows a preference for informal eateries and leisurely activities, i..."
+  },
+  {
+    "index": 1,
+    "prompt": "As a professional travel analyst and user profiling expert, analyze the user's POI (Point of Interest) trajectory data from their hometown to predict their potential travel style at their destination....",
+    "reference": "user's travel style is characterized by a casual and social approach, with a focus on local dining and informal socializing. The trajectory begins at the airport, indicating a short-term visit. The se..."
+  },
+  {
+    "index": 2,
+    "prompt": "As a professional travel analyst and user profiling expert, analyze the user's POI (Point of Interest) trajectory data from their hometown to predict their potential travel style at their destination....",
+    "reference": "user's travel style is primarily centered around casual social engagement and light exploration. The initial POIs suggest a focus on general entertainment and a convention center, indicating a possibl..."
+  }
+]

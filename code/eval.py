@@ -61,13 +61,6 @@ def main():
     parser.add_argument("--stop_epoch", type=int, default=2)  # early stopping
     parser.add_argument("--fine_stop", type=int, default=12)
 
-    # Model (lm).
-    parser.add_argument("--lm_hid_layers", type=int, default=3, help="Number of hidden layers in intensity function.")
-    parser.add_argument("--lm_latent_dim", type=int, default=128, help="Hidden layer dimension in intensity function.")
-    parser.add_argument("--sig_v", type=float, default=0.6,
-                        help="Observation variance.")  # Note: F 0.6 For Yelp, use 0.4
-
-    parser.add_argument("--s_infer", action="store_true")
     parser.add_argument("--use_llm", action="store_true", help="Use LLM for training")
     parser.add_argument("--use_target_llm", action="store_true", help="Use target LLM for training")
     parser.add_argument("--use_vllm", action="store_true", help="Use vllm for training")

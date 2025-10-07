@@ -99,13 +99,13 @@ def train_single_phase(model, train_loader, valid_loader, test_loader, args, log
     text_dataset = load_from_disk(args.dataset_path)
     prompts, references = [item['prompt'] for item in text_dataset], [item['reference'] for item in text_dataset]
 
-    # 读取 POI 元信息 (用于地理 / 类别 / 区域指标)
+    # Load POI metadata (used for geographic/category/region metrics)
     poi_meta = None
     try:
         with open(f'../{args.dataset_name}/poi_meta.pkl', 'rb') as f:
             poi_meta = pickle.load(f)
     except Exception as _e:
-        logger.log(f"[warn] 无法加载 poi_meta.pkl: {_e}")
+        logger.log(f"[warn] Failed to load poi_meta.pkl: {_e}")
 
     for e in range(args.epoch):
 
@@ -121,14 +121,13 @@ def train_single_phase(model, train_loader, valid_loader, test_loader, args, log
                 enumerate(train_loader), total=len(train_loader)):
             print("batch: %d/%d" % (b, number), end='\r')
             if args.use_target_llm:
-                # 提取uid对应的references，uid是tensor，需要转换为Python列表来索引prompts
+                # Extract references for each uid; convert the tensor to a Python list for indexing
                 batch_messages = [references[uid_item.item()] for uid_item in uid]
             else:
-                # 提取uid对应的messages，uid是tensor，需要转换为Python列表来索引prompts
+                # Extract prompts for each uid; convert the tensor to a Python list for indexing
                 batch_messages = [prompts[uid_item.item()] for uid_item in uid]
-            # 将messages转换为tensor并移到设备上
-            # 这里假设prompts已经是字符串，需要根据实际情况进行tokenization
-            messages = batch_messages  # 暂时保持为列表格式，具体tokenization在模型内部处理
+            # Keep messages as strings for now; tokenization is handled inside the model as needed
+            messages = batch_messages
             uid = uid.to(args.device)
             o_ck = o_ck.to(args.device)
             masked_d_ck = masked_d_ck.to(args.device)
@@ -172,12 +171,13 @@ def train_single_phase(model, train_loader, valid_loader, test_loader, args, log
             for b, (uid, o_ck, d_ck, masked_d_ck, o_h, d_h, masked_d_h, o_t, d_t, o_l, d_l, o_pad, d_pad, o_rg,
                     d_rg) in enumerate(valid_loader):
                 if args.use_target_llm:
-                    # 提取uid对应的references，uid是tensor，需要转换为Python列表来索引prompts
+                    # Extract references for each uid; convert the tensor to a Python list for indexing
                     batch_messages = [references[uid_item.item()] for uid_item in uid]
                 else:
-                    # 提取uid对应的messages，uid是tensor，需要转换为Python列表来索引prompts
+                    # Extract prompts for each uid; convert the tensor to a Python list for indexing
                     batch_messages = [prompts[uid_item.item()] for uid_item in uid]
-                messages = batch_messages  # 暂时保持为列表格式，具体tokenization在模型内部处理
+                # Keep messages as strings for now; tokenization is handled inside the model as needed
+                messages = batch_messages
                 uid = uid.to(args.device)
                 o_ck = o_ck.to(args.device)
                 masked_d_ck = masked_d_ck.to(args.device)
@@ -214,10 +214,10 @@ def train_single_phase(model, train_loader, valid_loader, test_loader, args, log
                     else:
                         alt_sample_pred = sample_pred
 
-                    # 计算新增指标 （包括首尾）
+                    # Compute additional metrics (including start/end elements)
                     inner_pred = sample_pred[1:-1]
                     inner_target = sample_target[1:-1]
-                    # 中间序列指标
+                    # Metrics for inner sequence elements
                     if inner_target.numel() > 0:
                         try:
                             batch_hit.append(metrics.hit_rate(inner_pred, inner_target))
@@ -239,7 +239,7 @@ def train_single_phase(model, train_loader, valid_loader, test_loader, args, log
 
 
 
-            # 新指标聚合
+            # Aggregate the additional metrics
             hit_mean = np.mean(batch_hit) if batch_hit else float('nan')
             recall_mean = np.mean(batch_recall) if batch_recall else float('nan')
             lev_mean = np.mean(batch_lev) if batch_lev else float('nan')
@@ -288,7 +288,7 @@ def _fmt(v):
 
 def get_test_result(model, test_loader, args, logger, prompts, references, poi_meta=None):
 
-    # 新指标收集
+    # Collect metrics for evaluation
     batch_hit = []
     batch_recall = []
     batch_lev = []
@@ -302,12 +302,13 @@ def get_test_result(model, test_loader, args, logger, prompts, references, poi_m
     for b, (uid, o_ck, d_ck, masked_d_ck, o_h, d_h, masked_d_h, o_t, d_t, o_l, d_l, o_pad, d_pad, o_rg, d_rg) in tqdm(
             enumerate(test_loader), total=len(test_loader.dataset) / args.test_batch):
         if args.use_target_llm:
-            # 提取uid对应的references，uid是tensor，需要转换为Python列表来索引prompts
+            # Extract references for each uid; convert the tensor to a Python list for indexing
             batch_messages = [references[uid_item.item()] for uid_item in uid]
         else:
-            # 提取uid对应的messages，uid是tensor，需要转换为Python列表来索引prompts
+            # Extract prompts for each uid; convert the tensor to a Python list for indexing
             batch_messages = [prompts[uid_item.item()] for uid_item in uid]
-        messages = batch_messages  # 暂时保持为列表格式，具体tokenization在模型内部处理
+        # Keep messages as strings for now; tokenization is handled inside the model as needed
+        messages = batch_messages
         uid = uid.to(args.device)
         o_ck = o_ck.to(args.device)
         masked_d_ck = masked_d_ck.to(args.device)
@@ -404,23 +405,24 @@ def test(model, model_path, test_loader, args, logger, n_region, train_am=None, 
     text_dataset = load_from_disk(args.dataset_path)
     prompts, references = [item['prompt'] for item in text_dataset], [item['reference'] for item in text_dataset]
 
-    # 读取 POI 元信息 (用于地理 / 类别 / 区域指标)
+    # Load POI metadata (used for geographic/category/region metrics)
     poi_meta = None
     try:
         with open(f'../{args.dataset_name}/poi_meta.pkl', 'rb') as f:
             poi_meta = pickle.load(f)
     except Exception as _e:
-        logger.log(f"[warn] 无法加载 poi_meta.pkl: {_e}")
+        logger.log(f"[warn] Failed to load poi_meta.pkl: {_e}")
 
     for b, (uid, o_ck, d_ck, masked_d_ck, o_h, d_h, masked_d_h, o_t, d_t, o_l, d_l, o_pad, d_pad, o_rg, d_rg) in tqdm(
             enumerate(test_loader), total=len(test_loader.dataset) / args.test_batch):
         if args.use_target_llm:
-            # 提取uid对应的references，uid是tensor，需要转换为Python列表来索引prompts
+            # Extract references for each uid; convert the tensor to a Python list for indexing
             batch_messages = [references[uid_item.item()] for uid_item in uid]
         else:
-            # 提取uid对应的messages，uid是tensor，需要转换为Python列表来索引prompts
+            # Extract prompts for each uid; convert the tensor to a Python list for indexing
             batch_messages = [prompts[uid_item.item()] for uid_item in uid]
-        messages = batch_messages  # 暂时保持为列表格式，具体tokenization在模型内部处理
+        # Keep messages as strings for now; tokenization is handled inside the model as needed
+        messages = batch_messages
         uid = uid.to(args.device)
         o_ck = o_ck.to(args.device)
         masked_d_ck = masked_d_ck.to(args.device)
