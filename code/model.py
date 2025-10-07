@@ -11,7 +11,7 @@ import numpy as np
 from mae import MaskedAutoEncoder
 
 class PositionalEncoding(nn.Module):
-    """正弦位置编码，用于给序列添加位置信息"""
+    """Sine positional encoding that injects location information into sequences."""
     def __init__(self, d_model, dropout=0.1, max_len=500):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
@@ -55,8 +55,8 @@ class Encoder(nn.Module):
                 dim_feedforward=2 * d_model,
                 batch_first=True,
                 dropout=dropout_prob,
-                norm_first=True,  # 使用Pre-LN架构更稳定
-                activation=F.gelu,  # 明确指定激活函数
+                norm_first=True,  # Use Pre-LN architecture for better stability
+                activation=F.gelu,  # Explicitly set activation function
             ) for _ in range(n_tf_layers)
         ])
 
@@ -80,34 +80,34 @@ class Encoder(nn.Module):
             dim=1,
         )
 
-        # PyTorch的src_key_padding_mask语义：True表示需要被忽略的位置
-        # 因此需要将d_pad取反（假设d_pad中True表示有效位置）
+        # In PyTorch, src_key_padding_mask=True marks positions to ignore
+        # Therefore invert d_pad (assuming True indicates a valid position)
         padding_mask = ~d_pad
 
-        # 调试信息和数值稳定性保护
+        # Debug information and numerical-stability guardrails
         for i, layer in enumerate(self.transformer_stack):
             try:
                 x_before = x.clone()
                 x_new = layer(x, src_key_padding_mask=padding_mask)
 
-                # 检查输出是否有效
+                # Validate transformer output
                 if torch.isnan(x_new).any() or torch.isinf(x_new).any():
                     print(f"Warning: NaN/Inf detected in transformer layer {i}")
                     print(f"Input range: [{x_before.min():.4f}, {x_before.max():.4f}]")
                     print(f"d_pad shape: {d_pad.shape}, unique values: {torch.unique(d_pad)}")
-                    # 保持原来的x不变，跳过这一层
+                    # Preserve the previous representation and skip this layer
                     continue
                 else:
                     x = x_new
 
             except Exception as e:
                 print(f"Error in transformer layer {i}: {e}")
-                # 跳过这一层，使用原来的x
+                # Skip this layer and keep the prior representation
                 continue
 
         x = x[:, -1, :]
 
-        return x, self.gamma_proj(x), torch.nn.functional.softplus(self.tau_proj(x))  # 更稳定
+        return x, self.gamma_proj(x), torch.nn.functional.softplus(self.tau_proj(x))  # Improves stability
 
 def kl_norm_norm(mu0, mu1, sig0, sig1):
     """Calculates KL divergence between two K-dimensional Normal
@@ -337,26 +337,26 @@ class SemPOIModel(nn.Module):
         self.seq_projection = nn.Linear(self.hidden_size, self.hidden_size)
         self.seq_norm = nn.LayerNorm(self.hidden_size)
         
-        # 时间和空间的Embedding层用于st_module
-        self.time_embedding = nn.Linear(1, self.hidden_size, bias=False)  # 时间是1维的
-        self.space_embedding = nn.Linear(2, self.hidden_size, bias=False)  # 空间是2维的
-        
-        # 为st_module添加位置编码
+        # Time and space embedding layers used by the ST module
+        self.time_embedding = nn.Linear(1, self.hidden_size, bias=False)  # Time has one dimension
+        self.space_embedding = nn.Linear(2, self.hidden_size, bias=False)  # Space has two dimensions
+
+        # Positional encodings for the ST module
         self.src_pos_encoding = PositionalEncoding(self.hidden_size, dropout=0.1, max_len=max_length_ori_id + max_length_venue_id + 10)
         self.tgt_pos_encoding = PositionalEncoding(self.hidden_size, dropout=0.1, max_len=max_length_ori_id + max_length_venue_id + 10)
-        
-        # 用于将拼接后的时间+空间+类别信息映射到统一维度
+
+        # Project concatenated time + space + category features to a unified dimension
         self.concat_to_unified = nn.Linear(3 * self.hidden_size, self.hidden_size, bias=False)
-        
-        # 为Masked AutoEncoder添加可学习的mask token
+
+        # Learnable mask token for the Masked AutoEncoder
         self.mask_token = nn.Parameter(torch.zeros(1, 1, self.hidden_size))
         nn.init.xavier_uniform_(self.mask_token)
-        
-        # 初始化MaskedAutoEncoder
+
+        # Initialize MaskedAutoEncoder when ST module is enabled
         if self.args.st_module:
             max_seq_len = max_length_ori_id + max_length_venue_id
-            # 使用main.py中设置的语义部分数量参数
-            num_semantic_parts = args.num_semantic_parts  # 默认0（禁用语义masking）
+            # Respect the semantic partition count configured in main.py
+            num_semantic_parts = args.num_semantic_parts  # Default 0 (disables semantic masking)
             self.mae = MaskedAutoEncoder(
                 seq_len=max_seq_len,
                 embed_dim=self.hidden_size,
@@ -409,74 +409,74 @@ class SemPOIModel(nn.Module):
         if self.args.use_llm:
             # self.args.kg = False
             self.args.s_infer = False
-            # 1. 通过LLM生成文本
+            # Step 1: Generate travel-style text via the LLM
             if self.args.use_target_llm:
                 generated_texts = messages
             else:
                 generated_texts = self.travel_style_generator.get_output(messages, max_length=512, temperature=0.7)
             print("UID:", uid)
             print("Generated Texts:", generated_texts)
-            # 2. 获取生成文本的embedding（截断到self.hidden_size维）
+            # Step 2: Obtain embeddings for the generated text (truncate to self.hidden_size dimensions)
             generated_embeddings = self.travel_style_reward_calculator.get_embedding(generated_texts,
                                                                                      embedding_dim=self.llm_embedding_dim)
             generated_embeddings = torch.tensor(generated_embeddings).to(self.args.device)  # [b, d]
-            # 对LLM embedding进行L2归一化
+            # Apply L2 normalization to the LLM embeddings
             generated_embeddings = F.normalize(generated_embeddings, p=2, dim=-1)
             P_L = generated_embeddings.unsqueeze(1).expand([generated_embeddings.shape[0], d_target_emb.shape[1], generated_embeddings.shape[1]])
         
 
         if self.args.st_module:
-            # 初始化损失变量
+            # Initialize loss accumulator
             seq2seq_loss = torch.tensor(0.0, device=self.args.device, dtype=torch.float32)
-            # 使用MaskedAutoEncoder进行序列到序列的预测
+            # Use the MaskedAutoEncoder for sequence-to-sequence prediction
             self.args.ode = False
             
-            # 修复维度不匹配问题：去除o_pad和d_pad的最后一个位置
-            o_pad_fixed = o_pad[:, :-1]  # [b, o_seq_len] 去除最后一个位置
-            d_pad_fixed = d_pad[:, :-1]  # [b, d_seq_len] 去除最后一个位置
+            # Fix dimensional mismatch by trimming the final position of o_pad and d_pad
+            o_pad_fixed = o_pad[:, :-1]  # [b, o_seq_len] remove the last slot
+            d_pad_fixed = d_pad[:, :-1]  # [b, d_seq_len] remove the last slot
             
-            # 构建源序列（家乡序列）的完整表征
+            # Build a full representation of the source (hometown) sequence
             o_time_emb = self.time_embedding(o_t.to(torch.float32).unsqueeze(-1))  # [b, o_seq_len, d]
             o_space_emb = self.space_embedding(o_l.to(torch.float32))  # [b, o_seq_len, d]
             o_concat_emb = torch.cat([o_time_emb, o_space_emb, o_emb], dim=-1)  # [b, o_seq_len, 3*d]
-            o_seq = self.concat_to_unified(o_concat_emb)  # [b, o_seq_len, d] 映射到统一维度
+            o_seq = self.concat_to_unified(o_concat_emb)  # [b, o_seq_len, d] unified projection
             
-            # 构建目标序列（目的地序列）的完整表征
+            # Build a full representation of the destination sequence
             d_time_emb = self.time_embedding(d_t.to(torch.float32).unsqueeze(-1))  # [b, d_seq_len, d]
             d_space_emb = self.space_embedding(d_l.to(torch.float32))  # [b, d_seq_len, d]
             d_concat_emb = torch.cat([d_time_emb, d_space_emb, d_target_emb], dim=-1)  # [b, d_seq_len, 3*d]
-            d_seq = self.concat_to_unified(d_concat_emb)  # [b, d_seq_len, d] 映射到统一维度
+            d_seq = self.concat_to_unified(d_concat_emb)  # [b, d_seq_len, d] unified projection
             
-            # ======================== 完全拼接家乡和目的地序列 ========================
-            # 将家乡序列和目标序列完全拼接，中间不留pad
+            # ======================== Fully concatenate hometown and destination sequences ========================
+            # Concatenate the hometown and destination sequences without inserting padding
             combined_seq_list = []
             combined_pad_list = []
             
             for i in range(batch_size):
-                # 获取家乡序列的有效长度
+                # Length of the valid portion in the hometown sequence
                 o_valid_len = o_pad_fixed[i].sum().item()
                 o_seq_valid = o_seq[i, :o_valid_len, :]  # [o_valid_len, d]
                 
-                # 获取目的地序列的有效长度
+                # Length of the valid portion in the destination sequence
                 d_valid_len = d_pad_fixed[i].sum().item()
                 d_seq_valid = d_seq[i, :d_valid_len, :]  # [d_valid_len, d]
                 
-                # 完全拼接（中间不留pad）
+                # Concatenate without leaving gaps
                 combined_seq = torch.cat([o_seq_valid, d_seq_valid], dim=0)  # [o_valid_len + d_valid_len, d]
                 combined_len = combined_seq.shape[0]
                 
-                # 创建对应的padding mask（True表示有效位置）
+                # Create a matching padding mask (True indicates a valid position)
                 combined_pad = torch.ones(combined_len, dtype=torch.bool, device=self.args.device)
                 
                 combined_seq_list.append(combined_seq)
                 combined_pad_list.append(combined_pad)
             
-            # 将序列pad到相同长度
+            # Pad sequences to the same length
             max_combined_len = max(seq.shape[0] for seq in combined_seq_list)
             combined_seq_padded = torch.zeros(batch_size, max_combined_len, self.hidden_size, device=self.args.device)
             combined_pad_padded = torch.zeros(batch_size, max_combined_len, dtype=torch.bool, device=self.args.device)
             
-            # 记录每个样本的家乡序列长度，用于后续提取目的地部分
+            # Track each sample's hometown length for extracting the destination segment later
             o_valid_lens = []
             d_valid_lens = []
             
@@ -485,32 +485,32 @@ class SemPOIModel(nn.Module):
                 combined_seq_padded[i, :seq_len, :] = seq
                 combined_pad_padded[i, :seq_len] = pad
                 
-                # 记录原始长度信息
+                # Record the original lengths
                 o_valid_len = o_pad_fixed[i].sum().item()
                 d_valid_len = d_pad_fixed[i].sum().item()
                 o_valid_lens.append(o_valid_len)
                 d_valid_lens.append(d_valid_len)
             
-            # ======================== 使用MaskedAutoEncoder ========================
+            # ======================== MaskedAutoEncoder processing ========================
             is_training = target_seq is not None
             
-            # 计算目的地序列的起始和终止位置
-            hometown_len_list = o_valid_lens  # 家乡序列长度
-            destination_start_list = o_valid_lens  # 目的地起始位置 = 家乡序列长度
-            destination_end_list = [o_valid_lens[i] + d_valid_lens[i] - 1 for i in range(batch_size)]  # 目的地终止位置
+            # Determine the start/end positions of the destination sequence
+            hometown_len_list = o_valid_lens  # Hometown sequence lengths
+            destination_start_list = o_valid_lens  # Destination starts immediately after hometown
+            destination_end_list = [o_valid_lens[i] + d_valid_lens[i] - 1 for i in range(batch_size)]  # Destination end indices
             
             if is_training:
-                # 设置LLM embedding作为cls_token（如果使用LLM）
+                # Optionally use the LLM embedding as a cls_token
                 if self.args.use_llm and generated_embeddings is not None:
                     self.mae.set_external_cls_token(generated_embeddings)
                 else:
                     self.mae.set_external_cls_token(None)
                 
-                # 训练时：随机掩码目的地序列的部分，保留起点终点
+                # During training: randomly mask parts of the destination while preserving endpoints
                 loss, pred, mask = self.mae(
                     combined_seq_padded,
                     uid=uid,
-                    mask_ratio=self.args.mask_ratio,  # 这个参数在训练时使用
+                    mask_ratio=self.args.mask_ratio,  # Training-time mask ratio
                     hometown_len_list=hometown_len_list,
                     destination_start_list=destination_start_list,
                     destination_end_list=destination_end_list,
@@ -519,36 +519,36 @@ class SemPOIModel(nn.Module):
                 )
                 seq2seq_loss = loss
                 
-                # 提取目的地部分的预测结果用于后续处理
+                # Extract destination predictions for downstream processing
                 P_D_list = []
                 for i in range(batch_size):
                     o_len = o_valid_lens[i]
                     d_len = d_valid_lens[i]
                     if d_len > 0:
-                        d_pred = pred[i, o_len:o_len+d_len, :]  # 提取目的地部分
-                        # Pad到原始目的地序列长度
+                        d_pred = pred[i, o_len:o_len+d_len, :]  # Destination slice
+                        # Pad back to the original destination length
                         d_pred_padded = torch.zeros(d_pad_fixed.shape[1], self.hidden_size, device=self.args.device)
                         d_pred_padded[:d_len, :] = d_pred
                         P_D_list.append(d_pred_padded)
                     else:
-                        # 如果没有有效的目的地序列，创建零填充
+                        # If no valid destination sequence exists, create zero padding
                         d_pred_padded = torch.zeros(d_pad_fixed.shape[1], self.hidden_size, device=self.args.device)
                         P_D_list.append(d_pred_padded)
                 
                 P_D = torch.stack(P_D_list, dim=0)  # [b, d_seq_len, d]
                 
             else:
-                # 设置LLM embedding作为cls_token（如果使用LLM）
+                # Optionally set the LLM embedding as cls_token
                 if self.args.use_llm and generated_embeddings is not None:
                     self.mae.set_external_cls_token(generated_embeddings)
                 else:
                     self.mae.set_external_cls_token(None)
                 
-                # 推理时：mask除了目的地起点终点外的其他目的地序列部分
+                # Inference: mask destination tokens except for start and end points
                 pred, mask = self.mae(
                     combined_seq_padded,
                     uid=uid,
-                    mask_ratio=self.args.mask_ratio,  # 这个参数在推理时不使用
+                    mask_ratio=self.args.mask_ratio,  # Not applied during inference
                     hometown_len_list=hometown_len_list,
                     destination_start_list=destination_start_list,
                     destination_end_list=destination_end_list,
@@ -556,26 +556,26 @@ class SemPOIModel(nn.Module):
                     training=False
                 )
                 
-                # 提取目的地部分的预测结果
+                # Extract destination predictions
                 P_D_list = []
                 for i in range(batch_size):
                     o_len = o_valid_lens[i]
                     d_len = d_valid_lens[i]
                     if d_len > 0:
-                        d_pred = pred[i, o_len:o_len+d_len, :]  # 提取目的地部分
-                        # Pad到原始目的地序列长度
+                        d_pred = pred[i, o_len:o_len+d_len, :]  # Destination slice
+                        # Pad back to the original destination length
                         d_pred_padded = torch.zeros(d_pad_fixed.shape[1], self.hidden_size, device=self.args.device)
                         d_pred_padded[:d_len, :] = d_pred
                         P_D_list.append(d_pred_padded)
                     else:
-                        # 如果没有有效的目的地序列，创建零填充
+                        # If no valid destination sequence exists, create zero padding
                         d_pred_padded = torch.zeros(d_pad_fixed.shape[1], self.hidden_size, device=self.args.device)
                         P_D_list.append(d_pred_padded)
                 
                 P_D = torch.stack(P_D_list, dim=0)  # [b, d_seq_len, d]
             
-            # 应用目的地序列的padding mask来屏蔽无效位置的输出
-            P_D = P_D * d_pad_fixed.unsqueeze(-1)  # 将无效位置置零
+            # Apply destination padding mask to suppress invalid positions
+            P_D = P_D * d_pad_fixed.unsqueeze(-1)  # Zero out invalid slots
 
         position_ids = torch.arange(seq_length, dtype=torch.long, device=query.device)
         position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
@@ -611,9 +611,9 @@ class SemPOIModel(nn.Module):
     
     def set_mae_llm_embedding(self, P_L):
         """
-        为MaskedAutoEncoder设置LLM embedding作为语义信息
+        Provide the MaskedAutoEncoder with LLM embeddings as semantic guidance.
         Args:
-            P_L: [N, D] LLM embedding，用于生成语义感知的masking策略
+            P_L: [N, D] LLM embeddings used to derive semantic-aware masking strategies.
         """
         if hasattr(self, 'mae') and self.mae is not None:
             self.mae.set_external_cls_token(P_L)

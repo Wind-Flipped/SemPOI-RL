@@ -115,10 +115,10 @@ def count_adjacent_repetition_rate(input_data):
 
 # ============================= New Metrics =========================== #
 def hit_rate(predict: torch.Tensor, target: torch.Tensor) -> float:
-    """Hit Rate: 逐位置命中率 (与分类准确率相同)。两序列长度相同。
+    """Hit Rate: position-wise accuracy (equivalent to classification accuracy).
     Args:
-        predict: 预测序列 (1D tensor)
-        target:  真值序列 (1D tensor)
+        predict: Predicted sequence (1D tensor)
+        target:  Ground-truth sequence (1D tensor)
     Returns: float
     """
     assert predict.shape == target.shape
@@ -128,21 +128,21 @@ def hit_rate(predict: torch.Tensor, target: torch.Tensor) -> float:
 
 
 def recall_rate(predict: torch.Tensor, target: torch.Tensor, unique: bool = True) -> float:
-    """Recall: 预测命中的真实 POI 覆盖率。
-    两种模式:
-      unique=False (默认): 按元素计数, min(预测与真实逐元素匹配次数, 真实长度)/真实长度。
-      unique=True: 基于集合: |Pred∩True| / |True|。
+    """Recall: coverage of ground-truth POIs hit by predictions.
+    Modes:
+        unique=False: Count element-wise matches, min(matches, |True|) / |True|.
+        unique=True: Set-based ratio |Pred ∩ True| / |True|.
     Args:
-        predict: 预测序列
-        target: 真实序列
-        unique: 是否基于集合
+        predict: Predicted sequence
+        target: Ground-truth sequence
+        unique: Whether to compute using set semantics
     """
     assert target.numel() > 0
     if unique:
         p_set = set(predict.tolist())
         t_set = set(target.tolist())
         return len(p_set & t_set) / max(1, len(t_set))
-    # 多重匹配 (稳定匹配策略)
+    # Allow multiple matches using a stable matching style strategy
     matched = 0
     used = [False]*target.numel()
     t_list = target.tolist()
@@ -156,7 +156,7 @@ def recall_rate(predict: torch.Tensor, target: torch.Tensor, unique: bool = True
 
 
 def levenshtein_distance(predict: torch.Tensor, target: torch.Tensor, normalize: bool = True) -> float:
-    """最短编辑距离 (Levenshtein). 可归一化到 [0,1] (距离 / max_len)。"""
+    """Minimum edit distance (Levenshtein). Optionally normalized to [0, 1] via distance / max_len."""
     p = predict.tolist()
     t = target.tolist()
     n, m = len(p), len(t)
@@ -172,9 +172,9 @@ def levenshtein_distance(predict: torch.Tensor, target: torch.Tensor, normalize:
     for i in range(1, n+1):
         for j in range(1, m+1):
             cost = 0 if p[i-1] == t[j-1] else 1
-            dp[i][j] = min(dp[i-1][j] + 1,      # 删除
-                           dp[i][j-1] + 1,      # 插入
-                           dp[i-1][j-1] + cost) # 替换
+            dp[i][j] = min(dp[i-1][j] + 1,      # deletion
+                           dp[i][j-1] + 1,      # insertion
+                           dp[i-1][j-1] + cost) # substitution
     dist = dp[n][m]
     if normalize:
         return dist / max(n, m)
@@ -182,8 +182,8 @@ def levenshtein_distance(predict: torch.Tensor, target: torch.Tensor, normalize:
 
 
 def dtw_distance(predict: torch.Tensor, target: torch.Tensor, normalize: bool = True) -> float:
-    """Dynamic Time Warping (基于0/1匹配代价)。代价: 相等=0, 不等=1。
-    若 normalize=True 返回 distance / (n+m)。"""
+    """Dynamic Time Warping with a 0/1 matching cost (match=0, mismatch=1).
+    When normalize=True, returns distance / (n + m)."""
     p = predict.tolist()
     t = target.tolist()
     n, m = len(p), len(t)
@@ -211,9 +211,10 @@ def _haversine(lat1, lon1, lat2, lon2):
 
 
 def average_geo_distance_error(predict: torch.Tensor, target: torch.Tensor, poi_meta: dict) -> float:
-    """平均地理距离误差: 逐位置 (经纬度已知) 计算预测与真值之间的哈弗辛距离 (km) 的平均。
-    缺失坐标的位置跳过; 若全部缺失返回 np.nan。
-    poi_meta[num_id] 应含 'lat','lon'."""
+    """Average geographic distance error: mean Haversine distance (km) between
+    predicted and ground-truth POIs at each position when latitude/longitude are available.
+    Skip positions with missing coordinates; return np.nan if all positions are skipped.
+    Expects poi_meta[num_id] to include 'lat' and 'lon'."""
     assert predict.shape == target.shape
     distances = []
     for pid, tid in zip(predict.tolist(), target.tolist()):
@@ -230,8 +231,9 @@ def average_geo_distance_error(predict: torch.Tensor, target: torch.Tensor, poi_
 
 
 def category_consistency_rate(predict: torch.Tensor, target: torch.Tensor, poi_meta: dict) -> float:
-    """类别一致率: 逐位置比较预测与真值 POI 的主类别(main_category 或 categories[0]) 是否相同。
-    若任一位置缺类别则跳过; 若全部跳过返回 np.nan。"""
+    """Category consistency: compare the primary category (main_category or categories[0])
+    between predicted and ground-truth POIs at each position.
+    Skip positions lacking category metadata; return np.nan if every position is skipped."""
     assert predict.shape == target.shape
     matches = 0
     total = 0
@@ -260,9 +262,9 @@ def category_consistency_rate(predict: torch.Tensor, target: torch.Tensor, poi_m
 
 
 def region_match_rate(predict: torch.Tensor, target: torch.Tensor, poi_meta: dict) -> float:
-    """区域一致率: 逐位置比较预测与真值 POI 的主区域(main_region 或 regions[0]) 是否相同。
-    若任一位置缺区域则跳过; 若全部跳过返回 np.nan。
-    """
+    """Region consistency: compare the primary region (main_region or regions[0])
+    between predicted and ground-truth POIs at each position.
+    Skip positions lacking region metadata; return np.nan if every position is skipped."""
     assert predict.shape == target.shape
     matches = 0
     total = 0
@@ -291,14 +293,15 @@ def region_match_rate(predict: torch.Tensor, target: torch.Tensor, poi_meta: dic
 
 
 def relative_path_distance_error(predict: torch.Tensor, target: torch.Tensor, poi_meta: dict, normalize: bool = True) -> float:
-    """相对路径距离误差:
-    计算预测轨迹与真实轨迹的路径总长 (相邻点哈弗辛距离求和), 返回 |L_pred - L_true| / L_true (若 normalize)。
-    若真实路径长度为 0 或无法计算则返回 nan。
+    """Relative path-length error:
+    Compare total path length of predicted versus ground-truth trajectories (sum of pairwise Haversine distances).
+    Return |L_pred - L_true| / L_true when normalize=True.
+    If the ground-truth path has zero length or cannot be computed, return np.nan.
     Args:
-        predict: 预测序列 1D tensor
-        target:  真值序列 1D tensor
-        poi_meta: 含 lat/lon 的字典
-        normalize: 是否返回相对误差 (True)；False 时返回绝对差 |L_pred - L_true| (km)
+        predict: Predicted sequence as a 1D tensor
+        target: Ground-truth sequence as a 1D tensor
+        poi_meta: Dictionary containing lat/lon metadata
+        normalize: Whether to compute relative error (True) or absolute difference |L_pred - L_true| in km
     """
     def path_len(seq):
         total = 0.0
@@ -326,10 +329,10 @@ def relative_path_distance_error(predict: torch.Tensor, target: torch.Tensor, po
 
 
 def centroid_geo_distance(predict: torch.Tensor, target: torch.Tensor, poi_meta: dict) -> float:
-    """重心(质心)经纬度距离:
-    取预测与真实轨迹中所有有效坐标的 (lat, lon) 平均作为质心, 计算两质心间哈弗辛距离 (km)。
-    若任一轨迹无有效坐标返回 nan。
-    """
+    """Centroid geodesic distance:
+    Compute the centroid (mean latitude/longitude) of each trajectory using valid coordinates
+    and return the Haversine distance (km) between the two centroids.
+    Return np.nan if either trajectory has no valid coordinates."""
     def centroid(seq):
         lats = []
         lons = []
@@ -349,7 +352,7 @@ def centroid_geo_distance(predict: torch.Tensor, target: torch.Tensor, poi_meta:
     return _haversine(c_p[0], c_p[1], c_t[0], c_t[1])
 
 def diversity_rate(predict: torch.Tensor) -> float:
-    """多样性: 预测序列中不同 POI 的比例。"""
+    """Diversity: proportion of unique POIs within the predicted sequence."""
     p_list = predict.tolist()
     if not p_list:
         return float('nan')

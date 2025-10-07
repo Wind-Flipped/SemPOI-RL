@@ -3,7 +3,7 @@ from ast import parse
 # import os
 # os.environ["CUDA_VISIBLE_DEVICES"] = "1, 2"  # Set the visible GPU device
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3'  # 设置可见GPU设备
+os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3'
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
@@ -124,7 +124,7 @@ def main():
     max_o_length = max(len(seq) for seq in data.oris)
 
     model = SemPOIModel(args, len(data.poi_idx) + 1, data.region_poi, max_d_length, max_o_length,
-                        d_model=args.hidden_size, n_head=4, num_encoder_layers=1, d_z=args.hidden_size, kg_dataset=kg_data).to(args.device)
+                        d_model=args.hidden_size, n_head=4, num_encoder_layers=1, d_z=args.hidden_size).to(args.device)
 
     # Training or testing the model based on the mode specified in args
 
