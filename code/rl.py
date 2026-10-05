@@ -12,7 +12,6 @@ This module provides:
 """
 import os
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3'  # Specify visible GPU devices
 import sys
 
 import torch
@@ -69,7 +68,9 @@ class _RLArgsStub:
                  tau=0.2, sig_v=0.6, confidence=0.5,
                  num_semantic_parts=8, lambda_diversity=0.1,
                  lambda_attn_reg=0.1, mask_ratio=0.75,
-                 dataset_name: str = "Yelp"):
+                 dataset_name: str = "Yelp",
+                 similarity_model_path: str = "../LLMs/Qwen3-Embedding-4B",
+                 similarity_device: str = "cuda:3"):
         self.device = device
         self.use_llm = use_llm
         self.use_target_llm = use_target_llm
@@ -91,6 +92,8 @@ class _RLArgsStub:
         self.lambda_diversity = lambda_diversity
         self.lambda_attn_reg = lambda_attn_reg
         self.mask_ratio = mask_ratio
+        self.similarity_model_path = similarity_model_path
+        self.similarity_device = similarity_device
 
 
 class F1RewardEvaluator:
@@ -99,17 +102,27 @@ class F1RewardEvaluator:
     model, compute the sample-level F1 (sample_f1) against the ground-truth destination trajectory,
     and return it as the reward.
     """
-    def __init__(self, dataset_name: str = "Yelp", run_name: str = "default",
-                 device: str = "cuda:1"):
+    def __init__(
+        self,
+        dataset_name: str = "Yelp",
+        run_name: str = "default",
+        device: str = "cuda:1",
+        checkpoint_path: str = None,
+        similarity_model_name: str = "../LLMs/Qwen3-Embedding-4B",
+        similarity_device: str = "cuda:3",
+    ):
         self.dataset_name = dataset_name
         self.run_name = run_name
         self.device = device
+        self.checkpoint_path = checkpoint_path
+        self.similarity_model_name = similarity_model_name
+        self.similarity_device = similarity_device
         self.poi_meta = None
         try:
             with open(f'../{dataset_name}/poi_meta.pkl', 'rb') as f:
                 self.poi_meta = pickle.load(f)
         except Exception as _e:
-            logger.log(f"[warn] Failed to load poi_meta.pkl: {_e}")
+            logger.warning("Failed to load poi_meta.pkl: %s", _e)
 
         self._data = None
         self._model = None
@@ -120,6 +133,11 @@ class F1RewardEvaluator:
 
     # ---------- Internal utilities ---------- #
     def _find_checkpoint(self) -> str:
+        if self.checkpoint_path:
+            checkpoint = os.path.abspath(self.checkpoint_path)
+            if not os.path.isfile(checkpoint):
+                raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+            return checkpoint
         base = os.path.abspath(os.path.join(os.path.dirname(__file__), f"../{self.dataset_name}/model_save/{self.run_name}"))
         if not os.path.isdir(base):
             raise FileNotFoundError(f"Model directory not found: {base}")
@@ -149,6 +167,8 @@ class F1RewardEvaluator:
             use_llm=True,
             use_target_llm=True,
             dataset_name=self.dataset_name,
+            similarity_model_path=self.similarity_model_name,
+            similarity_device=self.similarity_device,
         )
 
         self._data = TravelDataset(args_stub, ori_path, dst_path, trans_path)
@@ -249,7 +269,9 @@ class F1RewardEvaluator:
         )
         return loader
 
-    def compute_Refine_POI_reward(self, prompts, completions) -> list[float]:
+    def compute_Refine_POI_reward(
+        self, prompts, completions, sample_indices=None
+    ) -> list[float]:
         """
         Given a batch of RL-generated text, pick the samples in the dataset with matching order,
         feed the text into the model as messages, and return hit, recall, diversity, and category
@@ -260,9 +282,17 @@ class F1RewardEvaluator:
 
         bsz = len(msgs)
         N = len(self._data)
-        # Take consecutive indices with wrap-around if necessary
-        idxs = [ (self._offset + i) % N for i in range(bsz) ]
-        self._offset = (self._offset + bsz) % N
+        if sample_indices is None:
+            raise ValueError(
+                "GRPO reward requires explicit uid values; positional offset alignment is unsafe"
+            )
+        idxs = [int(index) for index in sample_indices]
+        if len(idxs) != bsz:
+            raise ValueError(
+                f"Reward UID count ({len(idxs)}) does not match completions ({bsz})"
+            )
+        if any(index < 0 or index >= N for index in idxs):
+            raise ValueError(f"Reward UID outside dataset range 0..{N - 1}: {idxs}")
 
         loader = self._get_subset_loader(idxs, batch_size=bsz)
 
@@ -337,7 +367,10 @@ class TravelStyleGRPOTrainer:
                  dataset_name: str = "Yelp",
                  model_run_name: str = "default",
                  is_sft: bool = False,
-                 need_similarity_model: bool = True):
+                 need_similarity_model: bool = True,
+                 reward_checkpoint_path: str = None,
+                 reward_device: str = "cuda:1",
+                 similarity_device: str = "cuda:3"):
         """
         Initialize the GRPO trainer.
 
@@ -359,6 +392,9 @@ class TravelStyleGRPOTrainer:
         self.dataset_name = dataset_name
         self.model_run_name = model_run_name
         self.need_similarity_model = need_similarity_model
+        self.reward_checkpoint_path = reward_checkpoint_path
+        self.reward_device = reward_device
+        self.similarity_device = similarity_device
 
         # Training progress tracking
         self.training_progress = None
@@ -371,17 +407,24 @@ class TravelStyleGRPOTrainer:
                 self.f1_evaluator = F1RewardEvaluator(
                     dataset_name=self.dataset_name,
                     run_name=self.model_run_name,
-                    device="cuda:1",
+                    device=self.reward_device,
+                    checkpoint_path=self.reward_checkpoint_path,
+                    similarity_model_name=similarity_model_name,
+                    similarity_device=self.similarity_device,
                 )
             except Exception as _e:
                 logger.error(f"Failed to pre-load F1RewardEvaluator: {_e}")
-                self.f1_evaluator = None
+                raise RuntimeError(
+                    "GRPO requires a loadable bootstrap SemPOI checkpoint"
+                ) from _e
 
         if is_train:
             # Initialize similarity model
             if not is_sft and need_similarity_model:
                 from sentence_transformers import SentenceTransformer
-                self.similarity_model = SentenceTransformer(similarity_model_name, device="cuda:3")
+                self.similarity_model = SentenceTransformer(
+                    similarity_model_name, device=self.similarity_device
+                )
 
             # Load the tokenizer
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -418,8 +461,12 @@ class TravelStyleGRPOTrainer:
                     self.model = get_peft_model(self.model, self.lora_config)
                 else:
                     from peft import PeftModel
-                    self.model = PeftModel.from_pretrained(self.model, self.lora_config, is_trainable=False)
-                    # Add a new LoRA adapter
+                    # Merge the frozen SFT adapter into the base weights, then train a
+                    # separate GRPO adapter. This keeps the saved GRPO directory a
+                    # standalone PEFT adapter that can be layered after SFT at inference.
+                    self.model = PeftModel.from_pretrained(
+                        self.model, self.lora_config, is_trainable=False
+                    ).merge_and_unload()
                     self.lora_config = LoraConfig(
                         r=lora_r,
                         lora_alpha=lora_alpha,
@@ -591,7 +638,9 @@ class TravelStyleGRPOTrainer:
             )
 
         # Define reward functions while capturing reference_responses and progress tracking
-        def Refine_POI_reward_func(prompts, completions, reference, **kwargs):
+        def Refine_POI_reward_func(
+            prompts, completions, reference, uid=None, **kwargs
+        ):
             self.training_progress.set_postfix({
                 'Step': f"{self.current_step}/{self.total_steps}",
                 'Phase': 'Refine POI reward computation'
@@ -599,7 +648,13 @@ class TravelStyleGRPOTrainer:
             if self.f1_evaluator is None:
                 logger.error("F1 evaluator unavailable, returning zero rewards")
                 return [0.0 for _ in range(len(completions))]
-            hit_scores, recall_scores, devisity_scores, cat_scores = self.f1_evaluator.compute_Refine_POI_reward(prompts, completions)
+            if uid is None:
+                raise ValueError(
+                    "Training dataset has no uid column; refusing unsafe positional reward alignment"
+                )
+            hit_scores, recall_scores, devisity_scores, cat_scores = self.f1_evaluator.compute_Refine_POI_reward(
+                prompts, completions, sample_indices=uid
+            )
             # Scale each reward component by its weight
 
             hit_scaled = [float(r) * 2.0 for r in hit_scores]
@@ -879,6 +934,44 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--use_accelerate", action="store_true", help="Enable accelerate for training")
     parser.add_argument("--lora_config", type=str, default=None, help="Path to existing SFT LoRA adapter config. Used for reinforcement learning.")
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default=os.environ.get("SEMPOI_LLM_MODEL_PATH", "../LLMs/Qwen3-8B"),
+        help="Qwen3-8B base model path.",
+    )
+    parser.add_argument(
+        "--similarity_model_name",
+        type=str,
+        default=os.environ.get(
+            "SEMPOI_SIMILARITY_MODEL_PATH", "../LLMs/Qwen3-Embedding-4B"
+        ),
+        help="Embedding model used by the SemPOI reward evaluator.",
+    )
+    parser.add_argument(
+        "--similarity_device",
+        type=str,
+        default=os.environ.get("SEMPOI_SIMILARITY_DEVICE", "cuda:3"),
+    )
+    parser.add_argument("--reward_device", type=str, default="cuda:1")
+    parser.add_argument(
+        "--reward_checkpoint",
+        type=str,
+        default=None,
+        help="Bootstrap SemPOI checkpoint used to score GRPO completions.",
+    )
+    parser.add_argument(
+        "--dataset_path",
+        type=str,
+        default=None,
+        help="HuggingFace prompt/reference dataset saved on disk.",
+    )
+    parser.add_argument(
+        "--train_split_path",
+        type=str,
+        default=None,
+        help="data_split.pkl; only its train indices are used for SFT/GRPO.",
+    )
     # SFT-specific arguments
     parser.add_argument("--sft", action="store_true", help="Run supervised fine-tuning (SFT)")
     parser.add_argument("--sft_epochs", type=int, default=1, help="Number of epochs for SFT")
@@ -890,23 +983,55 @@ def main():
     parser.add_argument("--sft_run_name", type=str, default="travel_style_sft", help="Name of the SFT run")
     parser.add_argument("--sft_project", type=str, default="travel-style-sft", help="SwanLab project name for SFT")
     parser.add_argument("--no_swanlab", action="store_true", help="Disable SwanLab logging during SFT")
-    parser.add_argument("--dataset_name", type=str, default="Foursquare", help="Dataset name (Foursquare/Yelp)")
+    parser.add_argument("--dataset_name", type=str, default="Foursquare", choices=["Foursquare", "Yelp"])
+    parser.add_argument("--rl_output", type=str, default=None)
+    parser.add_argument("--rl_run_name", type=str, default=None)
+    parser.add_argument("--rl_epochs", type=int, default=1)
+    parser.add_argument("--rl_lr", type=float, default=5e-5)
+    parser.add_argument("--rl_batch", type=int, default=1)
+    parser.add_argument("--rl_grad_accum", type=int, default=8)
+    parser.add_argument("--rl_num_generations", type=int, default=4)
+    parser.add_argument("--rl_max_prompt_len", type=int, default=2048)
+    parser.add_argument("--rl_max_completion_len", type=int, default=256)
+    parser.add_argument("--rl_save_steps", type=int, default=250)
     args = parser.parse_args()
     dataset_name = args.dataset_name
 
     from datasets import load_from_disk
-    if dataset_name == "Foursquare":
-        text_dataset = load_from_disk("../dataset/travel_dataset_20250712_201017")
-        output_dir = "./sft_grpo_Foursquare_test"
-        run_name = "Foursquare_sft_grpo_test"
-        # lora_config = "./sft_travel_style_lora_Foursquare_sftepoch1"
-    else:
-        text_dataset = load_from_disk("../dataset/Yelp_20250714_192438")
-        output_dir = "./sft_grpo_Yelp_test"
-        run_name = "Yelp_sft_grpo_epoch1_test"
-        # lora_config = "./sft_travel_style_lora_Yelp_sftepoch1"
+    default_dataset_path = (
+        "../dataset/travel_dataset_20250712_201017"
+        if dataset_name == "Foursquare"
+        else "../dataset/Yelp_20250714_192438"
+    )
+    dataset_path = args.dataset_path or default_dataset_path
+    split_path = args.train_split_path or f"../{dataset_name}/data_split.pkl"
+    if not os.path.isfile(split_path):
+        parser.error(
+            f"training split does not exist: {split_path}; run main.py --mode prepare_split first"
+        )
+    with open(split_path, "rb") as split_file:
+        train_indices, _, _ = pickle.load(split_file)
+    full_text_dataset = load_from_disk(dataset_path)
+    if len(full_text_dataset) == 0 or max(train_indices, default=-1) >= len(full_text_dataset):
+        parser.error(
+            f"split indices do not match text dataset: {split_path} vs {dataset_path}"
+        )
+    text_dataset = full_text_dataset.select(train_indices)
+    # The raw trajectory UID is a contiguous row index in travel.txt. Preserve it so
+    # TRL can pass the exact sample identity to the GRPO reward function.
+    if "uid" in text_dataset.column_names:
+        text_dataset = text_dataset.remove_columns("uid")
+    text_dataset = text_dataset.add_column("uid", train_indices)
+
+    output_dir = args.rl_output or f"../{dataset_name}/rl_travel_style_lora"
+    run_name = args.rl_run_name or f"{dataset_name}_grpo"
+    if not args.sft and not args.reward_checkpoint:
+        parser.error("--reward_checkpoint is required for GRPO training")
+    if not args.sft and not args.lora_config:
+        parser.error("--lora_config must point to the completed SFT adapter for GRPO")
     trainer = TravelStyleGRPOTrainer(
-        model_name="../LLMs/Qwen3-8B",
+        model_name=args.model_name,
+        similarity_model_name=args.similarity_model_name,
         model_run_name=dataset_name + "_semantic8_diversity0.1_attnreg0.1_mask0.75",
         dataset_name=dataset_name,
         use_lora=True,
@@ -915,7 +1040,10 @@ def main():
         lora_alpha=32,
         is_sft=args.sft,
         use_accelerate=args.use_accelerate,
-        need_similarity_model=False
+        need_similarity_model=False,
+        reward_checkpoint_path=args.reward_checkpoint,
+        reward_device=args.reward_device,
+        similarity_device=args.similarity_device,
     )
 
     if args.sft:
@@ -938,9 +1066,14 @@ def main():
             text_dataset=text_dataset,
             output_dir=output_dir,
             run_name=run_name,
-            num_train_epochs=1,
-            per_device_train_batch_size=1,
-            gradient_accumulation_steps=8,
+            num_train_epochs=args.rl_epochs,
+            learning_rate=args.rl_lr,
+            per_device_train_batch_size=args.rl_batch,
+            gradient_accumulation_steps=args.rl_grad_accum,
+            num_generations=args.rl_num_generations,
+            max_prompt_length=args.rl_max_prompt_len,
+            max_completion_length=args.rl_max_completion_len,
+            save_steps=args.rl_save_steps,
             use_Refine_POI_reward=True,
             is_gspo=False
         )

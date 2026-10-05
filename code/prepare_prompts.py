@@ -15,7 +15,6 @@ This script is responsible for:
 
 import sys
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '2,3'
 
 
 import argparse

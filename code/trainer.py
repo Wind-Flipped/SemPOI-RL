@@ -1,11 +1,21 @@
-# -*- coding: utf-8 -*-
-from torch.optim import Adam
-import torch.nn.functional as F
-from collections import  defaultdict
-from utils import *
-import metrics
-import pickle
 import numbers
+import os
+import pickle
+import random
+from collections import defaultdict
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.optim import Adam
+
+import metrics
+from cross_city_profile import (
+    build_cross_city_profile,
+    resolve_model_stage,
+    write_cross_city_profile,
+)
+from utils import save_model
 
 try:
     from tqdm import tqdm
@@ -93,6 +103,7 @@ def train_single_phase(model, train_loader, valid_loader, test_loader, args, log
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_dc_step, gamma=args.lr_dc)
 
     stopping_dict = defaultdict(float)
+    stopping_dict['best_RR'] = float('-inf')
     flag = True
 
     from datasets import load_from_disk
@@ -413,6 +424,27 @@ def test(model, model_path, test_loader, args, logger, n_region, train_am=None, 
     except Exception as _e:
         logger.log(f"[warn] Failed to load poi_meta.pkl: {_e}")
 
+    base_dataset = test_loader.dataset
+    while hasattr(base_dataset, "dataset"):
+        base_dataset = base_dataset.dataset
+    region_names = {
+        index: name for name, index in getattr(base_dataset, "region_idx", {}).items()
+    }
+    export_directory = getattr(args, "cross_city_export_dir", None)
+    model_stage = resolve_model_stage(
+        use_llm=args.use_llm,
+        use_lora=args.use_lora,
+        secondary_lora_path=args.lora_path2,
+        use_vllm=getattr(args, "use_vllm", False),
+    )
+    style_checkpoint = None
+    if model_stage == "base":
+        style_checkpoint = args.llm_model_path
+    elif model_stage == "sft":
+        style_checkpoint = args.lora_path
+    elif model_stage == "rl":
+        style_checkpoint = args.lora_path2
+
     for b, (uid, o_ck, d_ck, masked_d_ck, o_h, d_h, masked_d_h, o_t, d_t, o_l, d_l, o_pad, d_pad, o_rg, d_rg) in tqdm(
             enumerate(test_loader), total=len(test_loader.dataset) / args.test_batch):
         if args.use_target_llm:
@@ -440,6 +472,7 @@ def test(model, model_path, test_loader, args, logger, n_region, train_am=None, 
         d_rg = d_rg.to(args.device)
         predicted_ids = model(uid, messages, o_ck, masked_d_ck, o_t, d_t, o_l, d_l, o_pad, d_pad, d_ck, o_rg, d_rg,
                                 target_seq=None)
+        generated_styles = getattr(model, "last_generated_texts", [])
         # Process each sample in the batch separately
         for i in range(predicted_ids.shape[0]):
             # Extract the prediction and target for the current sample
@@ -453,6 +486,34 @@ def test(model, model_path, test_loader, args, logger, n_region, train_am=None, 
             non_padded_indices = sample_target != 0
             sample_pred = sample_pred[non_padded_indices]
             sample_target = sample_target[non_padded_indices]
+
+            if export_directory:
+                style_source = "unavailable"
+                travel_style = None
+                if i < len(generated_styles):
+                    travel_style = generated_styles[i]
+                    style_source = (
+                        "destination_reference"
+                        if args.use_target_llm
+                        else "model_generated"
+                    )
+                profile = build_cross_city_profile(
+                    user_id=uid[i].cpu().item(),
+                    dataset_name=args.dataset_name,
+                    origin_city=region_names.get(o_rg[i].cpu().item(), "Unknown"),
+                    destination_city=region_names.get(d_rg[i].cpu().item(), "Unknown"),
+                    model_stage=model_stage,
+                    predicted_poi_ids=sample_pred.tolist(),
+                    poi_meta=poi_meta or {},
+                    travel_style=travel_style,
+                    style_source=style_source,
+                    sequence_checkpoint=model_path,
+                    style_checkpoint=style_checkpoint,
+                )
+                output_path = os.path.join(
+                    export_directory, f"user_{uid[i].cpu().item()}.json"
+                )
+                write_cross_city_profile(profile, output_path)
 
             # If the sample length is greater than 1, perform alteration to keep the first and last elements unchanged
             if sample_target.numel() > 1:

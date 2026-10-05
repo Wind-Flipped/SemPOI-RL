@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3'
 from torch.utils.data import DataLoader
 
 import argparse
@@ -14,6 +13,7 @@ except:
 from data import TravelDataset, random_split
 from model import SemPOIModel
 from trainer import *
+from utils import Logger, collate_fn, path_exist, set_seeds
 
 
 def main():
@@ -29,6 +29,12 @@ def main():
     parser.add_argument("--kg_path", type=str, default=f'../{dataset_name}/kg.txt')
     parser.add_argument('--test_path', type=str)
     parser.add_argument('--data_split_path', type=str, default=f'../{dataset_name}/data_split.pkl')
+    parser.add_argument(
+        "--cross_city_export_dir",
+        type=str,
+        default=None,
+        help="Optional directory for portable profiles consumed by travel_RAG.",
+    )
 
     # Training Configurations
     parser.add_argument('--mode', type=str, default='train')
@@ -38,6 +44,12 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--hidden_size', type=int, default=256)
     parser.add_argument("--projection_dim", type=int, default=64)
+    parser.add_argument(
+        "--confidence",
+        type=float,
+        default=0.5,
+        help="Temperature-like scale used by top-p trajectory sampling.",
+    )
 
     parser.add_argument('--margin', type=int, default=1)
     parser.add_argument('--epoch', type=int, default=1000)
@@ -48,16 +60,46 @@ def main():
     parser.add_argument('--log_path', type=str, default='../')
     parser.add_argument('--log', action="store_true")
     parser.add_argument('--name', type=str, default="default")
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        default=None,
+        help="Optional output subdirectory name under model_save.",
+    )
     parser.add_argument('--device', type=str, default="cuda:0")
     parser.add_argument("--stop_epoch", type=int, default=2) # early stopping
     parser.add_argument("--fine_stop", type=int, default=12)
 
     parser.add_argument("--use_llm", action="store_true", help="Use LLM for training")
+    parser.add_argument(
+        "--llm_model_path",
+        type=str,
+        default=None,
+        help="Base LLM checkpoint path; required when --use_llm is set.",
+    )
+    parser.add_argument(
+        "--similarity_model_path",
+        type=str,
+        default=os.environ.get(
+            "SEMPOI_SIMILARITY_MODEL_PATH", "../LLMs/Qwen3-Embedding-4B"
+        ),
+        help="Text embedding model used for travel-style similarity.",
+    )
+    parser.add_argument(
+        "--similarity_device",
+        default=os.environ.get("SEMPOI_SIMILARITY_DEVICE", "cuda:0"),
+        help="Device for the text embedding model, for example cuda:0.",
+    )
     parser.add_argument("--use_target_llm", action="store_true", help="Use target LLM for training")
     parser.add_argument("--use_vllm", action="store_true", help="Use vllm for training")
     parser.add_argument("--llm_embedding_dim", type=int, default=256, help="Embedding dimension for LLM")
     parser.add_argument("--use_lora", action="store_true", help="Use LLM trained with LoRA for training")
-    parser.add_argument("--lora_path", type=str, default="./grpo_travel_style_lora_model/checkpoint-5500", help="Path to the LoRA model")
+    parser.add_argument(
+        "--lora_path",
+        type=str,
+        default=None,
+        help="Path to the SFT LoRA model; required when --use_lora is set.",
+    )
     parser.add_argument("--lora_path2", type=str, default=None, help="Path to the second LoRA model. Used for reinforcement learning")
     parser.add_argument("--dataset_path", type=str, default="../dataset/Yelp_20250714_192438", help="Path to the dataset for LLM training")
     parser.add_argument("--st_module", action="store_true", help="Use SpatialTemporal module")
@@ -68,6 +110,10 @@ def main():
     parser.add_argument("--mask_ratio", type=float, default=0.75, help="Mask ratio for MAE.")
 
     args = parser.parse_args()
+    if args.use_llm and not args.use_target_llm and not args.llm_model_path:
+        parser.error("--llm_model_path is required when --use_llm is set")
+    if args.use_lora and not args.lora_path:
+        parser.error("--lora_path is required when --use_lora is set")
     args.ori_data = f'../{args.dataset_name}/home.txt'
     args.dst_data = f'../{args.dataset_name}/oot.txt'
     args.trans_data = f'../{args.dataset_name}/travel.txt'
@@ -80,8 +126,17 @@ def main():
     elif args.dataset_name == 'Yelp':
         args.dataset_path = '../dataset/Yelp_20250714_192438'
     set_seeds(args.seed)
-    args.name = (args.dataset_name + "_semantic" + str(args.num_semantic_parts) + "_diversity" + str(args.lambda_diversity)
-            + "_attnreg" + str(args.lambda_attn_reg) + "_mask" + str(args.mask_ratio))
+    args.name = args.run_name or (
+        args.dataset_name
+        + "_semantic"
+        + str(args.num_semantic_parts)
+        + "_diversity"
+        + str(args.lambda_diversity)
+        + "_attnreg"
+        + str(args.lambda_attn_reg)
+        + "_mask"
+        + str(args.mask_ratio)
+    )
     args.save_path = os.path.join(args.save_path, args.name)
     path_exist(args.save_path)
 
@@ -91,7 +146,17 @@ def main():
 
     data = TravelDataset(args, args.ori_data, args.dst_data, args.trans_data)
 
-    train_data, valid_data, test_data = random_split(data, dataset_name=dataset_name, split_path=args.data_split_path)
+    train_data, valid_data, test_data = random_split(
+        data, dataset_name=args.dataset_name, split_path=args.data_split_path
+    )
+
+    if args.mode == "prepare_split":
+        logger.log(
+            "Prepared split: train=%d valid=%d test=%d path=%s"
+            % (len(train_data), len(valid_data), len(test_data), args.data_split_path)
+        )
+        logger.close_log()
+        return
 
     train_loader = DataLoader(train_data, args.train_batch, shuffle=True, collate_fn=collate_fn)
     valid_loader = DataLoader(valid_data, args.test_batch, shuffle=False, collate_fn=collate_fn)

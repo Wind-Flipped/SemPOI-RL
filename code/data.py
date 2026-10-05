@@ -211,30 +211,40 @@ def random_split(dataset, dataset_name, split_path, ratios=[0.8, 0.1, 0.1]):
     Returns:
         tuple
     """
-    trans = dataset.trans
-    trans_by_pair = defaultdict(list)
-    for u, t in enumerate(trans):
-        trans_by_pair[t].append(u)
-    
-    train_indice, valid_indice, test_indice = [], [], []
+    if os.path.exists(split_path):
+        with open(split_path, "rb") as file:
+            train_indice, valid_indice, test_indice = pickle.load(file)
+    else:
+        trans = dataset.trans
+        trans_by_pair = defaultdict(list)
+        for u, t in enumerate(trans):
+            trans_by_pair[t].append(u)
 
-    # if os.path.exists(split_path):
-    #     train_indice, valid_indice, test_indice = np.load(split_path, allow_pickle=True)
-    # else:
-    for t, us in trans_by_pair.items():
-        us_shuf = copy(us)
-        np.random.shuffle(us_shuf)
-        us_len = len(us)
+        train_indice, valid_indice, test_indice = [], [], []
+        for us in trans_by_pair.values():
+            us_shuf = copy(us)
+            np.random.shuffle(us_shuf)
+            us_len = len(us)
 
-        train_offset = int(us_len * ratios[0])
-        valid_offset = int(us_len * (ratios[0] + ratios[1]))
+            train_offset = int(us_len * ratios[0])
+            valid_offset = int(us_len * (ratios[0] + ratios[1]))
 
-        train_indice.extend(us_shuf[:train_offset])
-        valid_indice.extend(us_shuf[train_offset:valid_offset])
-        test_indice.extend(us_shuf[valid_offset:])
+            train_indice.extend(us_shuf[:train_offset])
+            valid_indice.extend(us_shuf[train_offset:valid_offset])
+            test_indice.extend(us_shuf[valid_offset:])
 
-    with open(f'../{dataset_name}/data_split.pkl', 'wb') as file:
-        pickle.dump([train_indice, valid_indice, test_indice], file)
+        os.makedirs(os.path.dirname(os.path.abspath(split_path)), exist_ok=True)
+        with open(split_path, "wb") as file:
+            pickle.dump([train_indice, valid_indice, test_indice], file)
+
+    all_indices = train_indice + valid_indice + test_indice
+    if len(all_indices) != len(dataset) or len(set(all_indices)) != len(dataset):
+        raise ValueError(
+            f"Invalid split in {split_path}: expected {len(dataset)} unique indices, "
+            f"got {len(all_indices)} entries and {len(set(all_indices))} unique indices"
+        )
+    if min(all_indices, default=0) < 0 or max(all_indices, default=-1) >= len(dataset):
+        raise ValueError(f"Split indices in {split_path} are outside the dataset range")
 
     return Subset(dataset, train_indice), Subset(dataset, valid_indice), Subset(dataset, test_indice)  # train_indices holds the indices for the training split
 

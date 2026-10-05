@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+Foursquare/cross_city_profiles/
+Yelp/cross_city_profiles/

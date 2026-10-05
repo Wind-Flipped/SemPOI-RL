@@ -1,10 +1,6 @@
 # -*- coding: utf-8 -*-
-from ast import parse
-# import os
-# os.environ["CUDA_VISIBLE_DEVICES"] = "1, 2"  # Set the visible GPU device
 import os
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3'  
 import torch
 from torch.utils.data import DataLoader
 
@@ -20,6 +16,7 @@ except:
 from data import TravelDataset, random_split
 from model import SemPOIModel
 from trainer import *
+from utils import Logger, collate_fn, path_exist, set_seeds
 
 import pickle
 
@@ -33,10 +30,25 @@ def main():
     parser.add_argument('--dst_data', type=str, default=f'../{dataset_name}/oot.txt')
     parser.add_argument('--trans_data', type=str, default=f'../{dataset_name}/travel.txt')
     parser.add_argument('--save_path', type=str, default=f'../{dataset_name}/model_save')
+    parser.add_argument(
+        '--checkpoint_path',
+        type=str,
+        default=None,
+        help=(
+            'Explicit SemPOI sequence checkpoint. When omitted, use the '
+            'paper code\'s dataset-specific model_*.xhr path.'
+        ),
+    )
     parser.add_argument("--best_save", action="store_true")
     parser.add_argument("--kg_path", type=str, default=f'../{dataset_name}/kg.txt')
     parser.add_argument('--test_path', type=str)
     parser.add_argument('--data_split_path', type=str, default=f'../{dataset_name}/data_split.pkl')
+    parser.add_argument(
+        "--cross_city_export_dir",
+        type=str,
+        default=None,
+        help="Optional directory for portable profiles consumed by travel_RAG.",
+    )
 
     # Training Configurations
     parser.add_argument('--mode', type=str, default='train')
@@ -46,6 +58,12 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--hidden_size', type=int, default=128)
     parser.add_argument("--projection_dim", type=int, default=64)
+    parser.add_argument(
+        "--confidence",
+        type=float,
+        default=0.5,
+        help="Temperature-like scale used by top-p trajectory sampling.",
+    )
 
     parser.add_argument('--margin', type=int, default=1)
     parser.add_argument('--epoch', type=int, default=1000)
@@ -62,12 +80,35 @@ def main():
     parser.add_argument("--fine_stop", type=int, default=12)
 
     parser.add_argument("--use_llm", action="store_true", help="Use LLM for training")
+    parser.add_argument(
+        "--llm_model_path",
+        type=str,
+        default=None,
+        help="Base LLM checkpoint path; required when --use_llm is set.",
+    )
+    parser.add_argument(
+        "--similarity_model_path",
+        type=str,
+        default=os.environ.get(
+            "SEMPOI_SIMILARITY_MODEL_PATH", "../LLMs/Qwen3-Embedding-4B"
+        ),
+        help="Text embedding model used for travel-style similarity.",
+    )
+    parser.add_argument(
+        "--similarity_device",
+        default=os.environ.get("SEMPOI_SIMILARITY_DEVICE", "cuda:0"),
+        help="Device for the text embedding model, for example cuda:0.",
+    )
     parser.add_argument("--use_target_llm", action="store_true", help="Use target LLM for training")
     parser.add_argument("--use_vllm", action="store_true", help="Use vllm for training")
     parser.add_argument("--llm_embedding_dim", type=int, default=256, help="Embedding dimension for LLM")
     parser.add_argument("--use_lora", action="store_true", help="Use LLM trained with LoRA for training")
-    parser.add_argument("--lora_path", type=str, default="./grpo_Yelp_f1_cat_0.75_0.1_8_lora_model/checkpoint-2250",
-                        help="Path to the LoRA model")
+    parser.add_argument(
+        "--lora_path",
+        type=str,
+        default=None,
+        help="Path to the SFT LoRA model; required when --use_lora is set.",
+    )
     parser.add_argument("--lora_path2", type=str, default=None)
     parser.add_argument("--dataset_path", type=str, default="../dataset/Yelp_20250714_192438",
                         help="Path to the dataset for LLM training")
@@ -84,6 +125,10 @@ def main():
     # Foursquare: ../dataset/travel_dataset_20250712_201017
     # Parsing command-line arguments
     args = parser.parse_args()
+    if args.use_llm and not args.use_target_llm and not args.llm_model_path:
+        parser.error("--llm_model_path is required when --use_llm is set")
+    if args.use_lora and not args.lora_path:
+        parser.error("--lora_path is required when --use_lora is set")
     args.ori_data = f'../{args.dataset_name}/home.txt'
     args.dst_data = f'../{args.dataset_name}/oot.txt'
     args.trans_data = f'../{args.dataset_name}/travel.txt'
@@ -93,32 +138,8 @@ def main():
     args.save_path = f'../{args.dataset_name}/model_save'
     if args.dataset_name == 'Foursquare':
         args.dataset_path = '../dataset/travel_dataset_20250712_201017'
-        # Path after reinforcement learning
-        # args.lora_path = "./sft_grpo_Foursquare_f1_cat_0.75_0.1_8_lora_model/checkpoint-1503"
-        # Path after one round of reinforcement learning
-        # args.lora_path = "./sft_grpo_Foursquare_f1_epoch1/checkpoint-1503"
-        # Path for SFT only
-        # args.lora_path = "./sft_travel_style_lora/checkpoint-752"
-        # Path for a single SFT epoch
-        args.lora_path = "./sft_travel_style_lora_Foursquare_sftepoch1/checkpoint-376"
-        # Path using the Refine-POI reward
-        # args.lora_path = "./sft_grpo_Foursquare_f1_RefinePOI"
-        args.lora_path2 = "./sft_grpo_Foursquare_f1_RefinePOI_newlora"
     elif args.dataset_name == 'Yelp':
         args.dataset_path = '../dataset/Yelp_20250714_192438'
-        # Path after two rounds of reinforcement learning
-        # args.lora_path = "./sft_grpo_Yelp_f1_cat_0.75_0.1_8_lora_model/checkpoint-2208"
-        # Path after one round of reinforcement learning
-        # args.lora_path = "./sft_grpo_Yelp_f1_epoch1/checkpoint-2208"
-        # Path for SFT only
-        # args.lora_path = "./sft_travel_style_lora_Yelp/checkpoint-4418"
-        # Path for a single SFT epoch
-        # args.lora_path = "./sft_travel_style_lora_Yelp_sftepoch1/checkpoint-553"
-        # Path using the real F1-score
-        args.lora_path = "./sft_grpo_Yelp_f1_epoch1_withRealf1"
-        # Path using the Refine-POI reward
-        # args.lora_path = "./sft_grpo_Yelp_f1_epoch1_RefinePOI"
-        args.lora_path2 = "./sft_grpo_Yelp_f1_epoch1_RefinePOI_newlora"
     set_seeds(args.seed)
     args.name = (args.dataset_name + "_semantic" + str(args.num_semantic_parts) + "_diversity" + str(
         args.lambda_diversity)
@@ -139,7 +160,9 @@ def main():
     data = TravelDataset(args, args.ori_data, args.dst_data, args.trans_data)
 
     # Checking if the knowledge graph (KG) option is enabled and loading KG data accordingly
-    train_data, valid_data, test_data = random_split(data, dataset_name=dataset_name, split_path=args.data_split_path)
+    train_data, valid_data, test_data = random_split(
+        data, dataset_name=args.dataset_name, split_path=args.data_split_path
+    )
 
     # train_loader = DataLoader(train_data, args.train_batch, shuffle=True, collate_fn=collate_fn)
     valid_loader = DataLoader(valid_data, args.test_batch, shuffle=False, collate_fn=collate_fn)
@@ -150,16 +173,25 @@ def main():
     max_o_length = max(len(seq) for seq in data.oris)
 
 
-    model = SemPOIModel(args, len(data.poi_idx) + 1, data.region_poi, max_d_length, max_o_length,
-                          d_model=args.hidden_size, n_head=4, num_encoder_layers=1, d_z=args.hidden_size)
-    if args.dataset_name == "Yelp" and args.eval_dataset == "test":
-        test(model, os.path.join(args.save_path, "model_5.xhr"), test_loader, args, logger, n_region)
-    elif args.dataset_name == "Foursquare" and args.eval_dataset == "test":
-        test(model, os.path.join(args.save_path, "model_0.xhr"), test_loader, args, logger, n_region)
-    elif args.dataset_name == "Yelp" and args.eval_dataset == "valid":
-        test(model, os.path.join(args.save_path, "model_5.xhr"), valid_loader, args, logger, n_region)
-    elif args.dataset_name == "Foursquare" and args.eval_dataset == "valid":
-        test(model, os.path.join(args.save_path, "model_0.xhr"), valid_loader, args, logger, n_region)
+    model = SemPOIModel(
+        args,
+        len(data.poi_idx) + 1,
+        data.region_poi,
+        max_d_length,
+        max_o_length,
+        d_model=args.hidden_size,
+        n_head=4,
+        num_encoder_layers=1,
+        d_z=args.hidden_size,
+    )
+    default_checkpoint_name = (
+        "model_5.xhr" if args.dataset_name == "Yelp" else "model_0.xhr"
+    )
+    checkpoint_path = args.checkpoint_path or os.path.join(
+        args.save_path, default_checkpoint_name
+    )
+    evaluation_loader = test_loader if args.eval_dataset == "test" else valid_loader
+    test(model, checkpoint_path, evaluation_loader, args, logger, n_region)
     logger.close_log()
 
 

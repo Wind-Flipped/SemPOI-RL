@@ -9,7 +9,6 @@ This module provides:
 """
 
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1, 2, 3'  # Set visible GPU devices
 
 import torch
 from transformers import (
@@ -52,7 +51,7 @@ class TravelStyleGenerator:
     """Travel style generator that wraps LLM inference."""
     
     def __init__(self, model_name: str = "../LLMs/Qwen3-8B", device: str = "cuda",
-                 use_vllm=False, use_lora=False, lora_path: str = "./grpo_travel_style_lora_model/checkpoint-5500",
+                 use_vllm=False, use_lora=False, lora_path: str = None,
                  lora_path2=None):
         """
         Initialize the travel style generator.
@@ -68,6 +67,14 @@ class TravelStyleGenerator:
         self.use_vllm = use_vllm
         self.use_lora = use_lora
         self.lora_path = lora_path
+        if use_lora and not lora_path:
+            raise ValueError("lora_path is required when use_lora=True")
+        if use_vllm and use_lora:
+            raise ValueError(
+                "The vLLM backend does not load this project's PEFT adapters. "
+                "Use the Transformers backend for SFT/RL profile exports."
+            )
+        self.model_stage = "base"
         # Silence vLLM logging
         logging.getLogger("vllm").setLevel(logging.CRITICAL)
 
@@ -80,14 +87,6 @@ class TravelStyleGenerator:
             self.sampling_params = SamplingParams(temperature=0.7, top_p=0.8, top_k=20, max_tokens=512)
             self.model = LLM(model=model_name, max_model_len=2048, tensor_parallel_size=2,
                              max_num_seqs=4, gpu_memory_utilization=0.8)
-            if use_lora:
-                try:
-                    from peft import PeftModel
-                    self.model = PeftModel.from_pretrained(self.model, lora_path)
-                    logger.info(f"LoRA parameters loaded from {lora_path} and merged with base model.")
-                except Exception as e:
-                    logger.error(f"Failed to load LoRA parameters: {e}")
-                    print(f"Failed to load LoRA parameters: {e}")
         else:
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
@@ -101,13 +100,18 @@ class TravelStyleGenerator:
                 try:
                     from peft import PeftModel
                     self.model = PeftModel.from_pretrained(self.model, lora_path, is_trainable=False)
+                    self.model_stage = "sft"
                     # 2 Lora configs
                     if lora_path2 is not None:
                         self.model = PeftModel.from_pretrained(self.model, lora_path2, is_trainable=False)
+                        self.model_stage = "rl"
                     logger.info(f"LoRA parameters loaded from {lora_path} and merged with base model.")
                 except Exception as e:
                     logger.error(f"Failed to load LoRA parameters: {e}")
-                    print(f"Failed to load LoRA parameters: {e}")
+                    raise RuntimeError(
+                        "Failed to load the requested LoRA checkpoint; refusing to "
+                        "continue with a mislabeled Base/SFT/RL run."
+                    ) from e
 
         logger.info(f"Travel style generator initialized with {model_name}")
 
@@ -209,20 +213,29 @@ class TravelStyleGenerator:
             return generated_texts
 
         except Exception as e:
-            print(f"Error in batch generation from messages: {e}")
-            return messages  # Fallback to original prompts
+            raise RuntimeError(
+                "Travel-style generation failed; refusing to substitute the input "
+                "prompt as a generated style."
+            ) from e
 
 class TravelStyleRewardCalculator:
     """Compute similarity and rewards for travel-style descriptions."""
 
-    def __init__(self, similarity_model: str = "../LLMs/Qwen3-Embedding-4B"):
+    def __init__(
+        self,
+        similarity_model: str = "../LLMs/Qwen3-Embedding-4B",
+        device: str = "cuda:0",
+    ):
         """
         Initialize the reward calculator.
 
         Args:
             similarity_model: Model used to compute text similarity.
         """
-        self.similarity_model = SentenceTransformer(similarity_model, device="cuda:2")
+        self.similarity_model = SentenceTransformer(
+            similarity_model,
+            device=device,
+        )
         logger.info(f"Reward calculator initialized with {similarity_model}")
 
     def calculate_similarity(self, text1: str, text2: str) -> float:

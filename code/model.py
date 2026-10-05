@@ -132,9 +132,23 @@ class SemPOIModel(nn.Module):
 
         super(SemPOIModel, self).__init__()
         # initial LLMs
-        self.travel_style_reward_calculator = TravelStyleRewardCalculator()
+        self.last_generated_texts = []
+        self.travel_style_reward_calculator = TravelStyleRewardCalculator(
+            similarity_model=getattr(
+                args,
+                "similarity_model_path",
+                "../LLMs/Qwen3-Embedding-4B",
+            ),
+            device=getattr(args, "similarity_device", args.device),
+        )
         if args.use_llm and not args.use_target_llm:
-            self.travel_style_generator = TravelStyleGenerator(use_vllm=args.use_vllm, use_lora=args.use_lora, lora_path=args.lora_path, lora_path2=args.lora_path2)
+            self.travel_style_generator = TravelStyleGenerator(
+                model_name=args.llm_model_path,
+                use_vllm=args.use_vllm,
+                use_lora=args.use_lora,
+                lora_path=args.lora_path,
+                lora_path2=args.lora_path2,
+            )
         # initial hyperparameter
         self.hidden_size = d_model
         self.args = args
@@ -234,6 +248,7 @@ class SemPOIModel(nn.Module):
                 generated_texts = messages
             else:
                 generated_texts = self.travel_style_generator.get_output(messages, max_length=512, temperature=0.7)
+            self.last_generated_texts = list(generated_texts)
             print("UID:", uid)
             print("Generated Texts:", generated_texts)
             # Step 2: Obtain embeddings for the generated text (truncate to self.hidden_size dimensions)
